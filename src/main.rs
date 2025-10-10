@@ -191,6 +191,50 @@ impl LlmTool {
 
         Ok((stdout, stderr))
     }
+
+    /// Invoke the LLM with thinking disabled for simple verification tasks
+    fn invoke_without_thinking(&self, prompt: &str) -> Result<(String, String)> {
+        match self {
+            Self::Claude => {
+                // For Claude Code, wrap the prompt with thinking_mode disabled
+                let wrapped_prompt = format!(
+                    "<thinking_mode>disabled</thinking_mode>\n\n{}",
+                    prompt
+                );
+                self.invoke(&wrapped_prompt)
+            }
+            Self::Codex => {
+                // For Codex CLI, use minimal reasoning effort
+                let mut args = self.args();
+                args.push("-c".to_string());
+                args.push("model_reasoning_effort=\"minimal\"".to_string());
+
+                let mut child = Command::new(self.command())
+                    .args(args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .with_context(|| {
+                        format!(
+                            "Failed to spawn {} process. Is {} CLI installed?",
+                            self.name(),
+                            self.name()
+                        )
+                    })?;
+
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(prompt.as_bytes())?;
+                }
+
+                let output = child.wait_with_output()?;
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                Ok((stdout, stderr))
+            }
+        }
+    }
 }
 
 /// Manages multiple LLM tools with automatic fallback
@@ -287,6 +331,80 @@ impl LlmToolChain {
             }
 
             match tool.invoke(prompt) {
+                Ok((stdout, stderr)) => {
+                    if tool.is_rate_limited(&stdout, &stderr) {
+                        // Mark this tool as rate limited
+                        self.mark_rate_limited(&tool);
+
+                        let rate_limit_msg = format!(
+                            "Rate limit detected for {}. Temporarily squelching for 5 minutes.",
+                            tool.name()
+                        );
+                        println!("{}", rate_limit_msg);
+                        if let Some(log) = logger.as_mut() {
+                            let _ = log.logln(&rate_limit_msg);
+                        }
+
+                        if let Some(next_tool) = self.switch_to_next() {
+                            let switch_msg = format!(
+                                "Switching to fallback tool: {}",
+                                next_tool.name()
+                            );
+                            println!("{}", switch_msg);
+                            if let Some(log) = logger.as_mut() {
+                                let _ = log.logln(&switch_msg);
+                            }
+                            continue;
+                        } else {
+                            anyhow::bail!("All LLM tools exhausted due to rate limits");
+                        }
+                    }
+
+                    return Ok((stdout, stderr));
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Error invoking {}: {}",
+                        tool.name(),
+                        e
+                    );
+                    println!("{}", error_msg);
+                    if let Some(log) = logger.as_mut() {
+                        let _ = log.logln(&error_msg);
+                    }
+
+                    if let Some(next_tool) = self.switch_to_next() {
+                        let switch_msg = format!(
+                            "Switching to fallback tool: {}",
+                            next_tool.name()
+                        );
+                        println!("{}", switch_msg);
+                        if let Some(log) = logger.as_mut() {
+                            let _ = log.logln(&switch_msg);
+                        }
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invoke with fallback, but with thinking disabled for simple verification tasks
+    fn invoke_with_fallback_without_thinking(&mut self, prompt: &str, logger: &mut Option<Logger>) -> Result<(String, String)> {
+        // Try to reset to a more preferred tool if rate limit has expired
+        self.try_reset_to_preferred(logger);
+
+        loop {
+            let tool = self.current_tool().clone();
+            let tool_msg = format!("Using LLM tool: {} (thinking disabled)", tool.name());
+            println!("{}", tool_msg);
+            if let Some(log) = logger.as_mut() {
+                let _ = log.logln(&tool_msg);
+            }
+
+            match tool.invoke_without_thinking(prompt) {
                 Ok((stdout, stderr)) => {
                     if tool.is_rate_limited(&stdout, &stderr) {
                         // Mark this tool as rate limited
@@ -581,7 +699,7 @@ Text to analyze:
         let _ = log.logln(&verify_msg);
     }
 
-    match tool_chain.invoke_with_fallback(&verification_prompt, logger) {
+    match tool_chain.invoke_with_fallback_without_thinking(&verification_prompt, logger) {
         Ok((verify_stdout, _)) => {
             let is_confirmed = verify_stdout.contains(completion_token);
 
