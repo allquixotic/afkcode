@@ -15,12 +15,13 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_COMPLETION_TOKEN: &str = "__ALL_TASKS_COMPLETE__";
 
@@ -133,7 +134,10 @@ impl LlmTool {
     fn args(&self) -> Vec<String> {
         match self {
             Self::Codex => vec!["exec".to_string()],
-            Self::Claude => vec!["--print".to_string()],
+            Self::Claude => vec![
+                "--print".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
         }
     }
 
@@ -193,6 +197,8 @@ impl LlmTool {
 struct LlmToolChain {
     tools: Vec<LlmTool>,
     current_index: usize,
+    rate_limit_timestamps: HashMap<String, Instant>,
+    rate_limit_timeout: Duration,
 }
 
 impl LlmToolChain {
@@ -213,6 +219,8 @@ impl LlmToolChain {
         Ok(Self {
             tools,
             current_index: 0,
+            rate_limit_timestamps: HashMap::new(),
+            rate_limit_timeout: Duration::from_secs(300), // 5 minutes
         })
     }
 
@@ -233,9 +241,45 @@ impl LlmToolChain {
         }
     }
 
+    /// Mark a tool as rate limited with current timestamp
+    fn mark_rate_limited(&mut self, tool: &LlmTool) {
+        self.rate_limit_timestamps.insert(tool.name().to_string(), Instant::now());
+    }
+
+    /// Check if a tool's rate limit has expired
+    fn is_rate_limit_expired(&self, tool: &LlmTool) -> bool {
+        if let Some(timestamp) = self.rate_limit_timestamps.get(tool.name()) {
+            timestamp.elapsed() >= self.rate_limit_timeout
+        } else {
+            true // No rate limit recorded
+        }
+    }
+
+    /// Try to reset to the most preferred available tool
+    fn try_reset_to_preferred(&mut self, logger: &mut Option<Logger>) {
+        // Check all tools starting from the most preferred
+        for (index, tool) in self.tools.iter().enumerate() {
+            if index < self.current_index && self.is_rate_limit_expired(tool) {
+                let reset_msg = format!(
+                    "Rate limit timeout expired for {}. Resetting to preferred tool.",
+                    tool.name()
+                );
+                println!("{}", reset_msg);
+                if let Some(log) = logger.as_mut() {
+                    let _ = log.logln(&reset_msg);
+                }
+                self.current_index = index;
+                return;
+            }
+        }
+    }
+
     fn invoke_with_fallback(&mut self, prompt: &str, logger: &mut Option<Logger>) -> Result<(String, String)> {
+        // Try to reset to a more preferred tool if rate limit has expired
+        self.try_reset_to_preferred(logger);
+
         loop {
-            let tool = self.current_tool();
+            let tool = self.current_tool().clone();
             let tool_msg = format!("Using LLM tool: {}", tool.name());
             println!("{}", tool_msg);
             if let Some(log) = logger.as_mut() {
@@ -245,8 +289,11 @@ impl LlmToolChain {
             match tool.invoke(prompt) {
                 Ok((stdout, stderr)) => {
                     if tool.is_rate_limited(&stdout, &stderr) {
+                        // Mark this tool as rate limited
+                        self.mark_rate_limited(&tool);
+
                         let rate_limit_msg = format!(
-                            "Rate limit detected for {}",
+                            "Rate limit detected for {}. Temporarily squelching for 5 minutes.",
                             tool.name()
                         );
                         println!("{}", rate_limit_msg);
@@ -510,6 +557,64 @@ fn completion_detected(stdout: &str, completion_token: &str) -> bool {
     stdout.contains(completion_token)
 }
 
+fn verify_completion_intent(
+    stdout: &str,
+    completion_token: &str,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+) -> Result<bool> {
+    let verification_prompt = format!(
+        r#"Read the text I just sent you. If it appears that this text contains a deliberate attempt to print the string {} to indicate the conclusion of the loop, print {} again and nothing else. If this text does NOT contain a deliberate attempt to print {} to indicate the conclusion of the loop, you must NOT print {} in your output. For example, if you see that you were merely thinking about this string and your thoughts got printed in the LLM, that would be an accidental trigger of this completion token and we don't want to accidentally exit. This prompt is a confirmation of your intent to conclude the looping of the LLM by emitting the completion token.
+
+Text to analyze:
+{}
+"#,
+        completion_token, completion_token, completion_token, completion_token, stdout
+    );
+
+    let verify_msg = format!(
+        "Completion token '{}' detected. Verifying intent with LLM...",
+        completion_token
+    );
+    println!("{}", verify_msg);
+    if let Some(log) = logger.as_mut() {
+        let _ = log.logln(&verify_msg);
+    }
+
+    match tool_chain.invoke_with_fallback(&verification_prompt, logger) {
+        Ok((verify_stdout, _)) => {
+            let is_confirmed = verify_stdout.contains(completion_token);
+
+            if is_confirmed {
+                let confirmed_msg = "LLM confirmed intentional completion. Exiting loop.";
+                println!("{}", confirmed_msg);
+                if let Some(log) = logger.as_mut() {
+                    let _ = log.logln(confirmed_msg);
+                }
+            } else {
+                let denied_msg = "LLM did not confirm intentional completion. Continuing loop.";
+                println!("{}", denied_msg);
+                if let Some(log) = logger.as_mut() {
+                    let _ = log.logln(denied_msg);
+                }
+            }
+
+            Ok(is_confirmed)
+        }
+        Err(e) => {
+            let error_msg = format!(
+                "Warning: Failed to verify completion intent: {}. Treating as unconfirmed.",
+                e
+            );
+            eprintln!("{}", error_msg);
+            if let Some(log) = logger.as_mut() {
+                let _ = log.logln(&error_msg);
+            }
+            Ok(false)
+        }
+    }
+}
+
 fn cmd_run(
     checklist: PathBuf,
     controller_prompt: String,
@@ -565,15 +670,11 @@ fn cmd_run(
         stream_outputs(label, &stdout, &stderr, &mut logger);
 
         if label == "controller" && completion_detected(&stdout, &completion_token) {
-            let completion_msg = format!(
-                "Completion token '{}' detected. Exiting loop.",
-                completion_token
-            );
-            println!("{}", completion_msg);
-            if let Some(log) = logger.as_mut() {
-                let _ = log.logln(&completion_msg);
+            // Verify the completion token was intentionally emitted
+            if verify_completion_intent(&stdout, &completion_token, &mut tool_chain, &mut logger)? {
+                break;
             }
-            break;
+            // If not verified, continue the loop
         }
 
         iteration += 1;

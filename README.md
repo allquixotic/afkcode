@@ -9,7 +9,8 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 - **Checklist Management**: Add, remove, and update checklist items with or without LLM assistance
 - **Standing Orders**: Built-in project invariants ensure consistent LLM behavior
 - **Multi-LLM Support**: Automatic fallback between Codex CLI and Claude Code on rate limits
-- **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted
+- **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted with temporary 5-minute squelching
+- **Completion Token Verification**: LLM confirms intentional completion to prevent accidental loop exits
 - **Output Logging**: Automatically streams all LLM output and console messages to a configurable log file during run mode
 
 ## Installation
@@ -76,11 +77,20 @@ afkcode run project.md --tools codex,claude --sleep-seconds 30
 **How Fallback Works:**
 1. Starts with first tool in list (e.g., `codex`)
 2. If rate limit detected, automatically switches to next tool (`claude`)
-3. Continues development loop seamlessly
-4. Only exits if all tools exhausted or completion detected
+3. Rate-limited tools are temporarily squelched for 5 minutes
+4. After 5 minutes, the system automatically tries the most preferred tool again
+5. Continues development loop seamlessly
+6. Only exits if all tools exhausted or completion detected
+
+**Completion Token Verification:**
+When the completion token is detected in controller output:
+1. The system invokes an LLM to verify the token was intentionally emitted
+2. The LLM analyzes the output to distinguish deliberate completion from accidental mentions
+3. Only if the LLM confirms by emitting the token again does the loop exit
+4. This prevents false positives from LLM thinking/reasoning traces
 
 **Exit Conditions:**
-- Controller emits completion token (default: `__ALL_TASKS_COMPLETE__`)
+- Controller emits completion token (default: `__ALL_TASKS_COMPLETE__`) AND LLM confirms intent
 - All LLM tools exhausted due to rate limits
 - User presses Ctrl+C
 
@@ -392,10 +402,12 @@ afkcode supports these LLM CLI tools with automatic fallback:
 
 1. **Codex CLI** (`codex`)
    - Command: `codex exec`
+   - Configuration: Requires `~/.codex/config.toml` with `approval_policy = "never"`
    - Rate limit detection: "rate limit reached", "429", "rate_limit_error"
 
 2. **Claude Code** (`claude`)
-   - Command: `claude --print`
+   - Command: `claude --print --dangerously-skip-permissions`
+   - Flags automatically added by afkcode for unattended operation
    - Rate limit detection: "usage limit reached", "limit will reset", "429"
 
 ### Using Default Fallback
@@ -424,6 +436,34 @@ afkcode run checklist.md --tools claude,codex
 ```
 
 **Note**: Both tools must be installed and available on your PATH for fallback to work.
+
+### Unattended Configuration
+
+For autonomous operation, afkcode requires both LLM tools to be configured for unattended/automatic execution without prompts.
+
+#### Codex CLI Configuration
+
+Codex CLI is configured via `~/.codex/config.toml`. Required settings for unattended operation:
+
+```toml
+approval_policy = "never"
+sandbox_mode    = "danger-full-access"
+```
+
+This disables all approval prompts and grants full system access. The `approval_policy = "never"` setting ensures Codex executes all commands automatically without asking for confirmation.
+
+#### Claude Code Configuration
+
+Claude Code uses CLI flags for unattended operation. afkcode automatically passes the following flags:
+
+```bash
+claude --print --dangerously-skip-permissions
+```
+
+- `--print`: Non-interactive output mode
+- `--dangerously-skip-permissions`: Enables "Safe YOLO mode" for fully unattended execution without approval prompts
+
+**Security Note**: These settings grant the LLM unrestricted access to your system. Only use in trusted development environments. Consider running in an isolated container or VM for additional safety.
 
 ## Tips & Best Practices
 
@@ -516,13 +556,18 @@ cargo run -- --help
 
 ## Recent Changes
 
+### New Features (Latest)
+
+- **Temporary Tool Squelching**: Rate-limited tools are now temporarily disabled for 5 minutes instead of permanently. After the timeout, the system automatically attempts to use the most preferred tool again.
+- **Completion Token Verification**: When the completion token is detected, an LLM verification step confirms the token was intentionally emitted before exiting the loop. This prevents false positives from accidental mentions in LLM reasoning traces.
+
 ### Bug Fixes
 
 - **Fixed sub-item formatting**: Sub-items now properly include the dash prefix (`    - [ ]` instead of `    [ ]`)
 - **Fixed section-specific add**: Items added with `--section` now correctly appear in the specified section
 - **Fixed standing orders preservation**: The `update` command now automatically restores standing orders if the LLM removes them
 
-### New Features
+### Previous Features
 
 - **Configuration file support**: Added `afkcode.toml` support for persistent configuration
 - **Global --config flag**: Specify custom configuration file paths
