@@ -1,0 +1,792 @@
+// Copyright (c) 2025 Sean McNamara <smcnam@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+const DEFAULT_COMPLETION_TOKEN: &str = "__ALL_TASKS_COMPLETE__";
+
+const DEFAULT_CONTROLLER_PROMPT: &str = r#"
+You are the controller in an autonomous development loop.
+Study the shared checklist in @{checklist}, summarize current progress, and update it as needed.
+Assign the next actionable task to the worker so momentum continues.
+If—and only if—all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
+"#;
+
+const DEFAULT_WORKER_PROMPT: &str = "@{checklist} Do the thing.";
+
+const STANDING_ORDERS: &str = r#"# STANDING ORDERS - DO NOT DELETE
+
+1. All additions to this document must be only the minimum amount of information for an LLM to understand the task.
+2. When an item is fully complete, remove it from the checklist entirely. If you only partially completed it, add a sub-item with the remaining work and put a ~ in the checkbox instead of an x.
+3. When you finish coding, if you discovered new items to work on during your work, add them to this document in the appropriate checklist. Be succinct.
+4. Before you finish your work, do a Git commit of files you have modified in this turn.
+5. Do not alter or delete any standing orders.
+6. Checklist items in this file must never require manual human effort or refer to testing of any kind, only design and coding activities.
+7. The command "Do the thing" means: review the remaining to-do items in this file; arbitrarily pick an important item to work on; do that item; update this file, removing 100% complete steps or adding sub-items to partially completed steps, then do a compile of affected projects, making sure they build, fixing errors if not; lastly, do a Git commit of changed files.
+8. The command "Fix shit" means: identify to-do items or known issues that are about *broken* code or design, i.e. things that have been left incomplete, code that doesn't compile (errors), or problems that need to be solved, then go solve them, then update this document and do a Git commit.
+"#;
+
+/// LLM tool configuration and invocation logic
+#[derive(Debug, Clone)]
+enum LlmTool {
+    Codex,
+    Claude,
+}
+
+impl LlmTool {
+    fn from_name(name: &str) -> Result<Self> {
+        match name.to_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => anyhow::bail!("Unsupported LLM tool: {}. Supported: codex, claude", name),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn command(&self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn args(&self) -> Vec<String> {
+        match self {
+            Self::Codex => vec!["exec".to_string()],
+            Self::Claude => vec!["--print".to_string()],
+        }
+    }
+
+    fn rate_limit_patterns(&self) -> Vec<&'static str> {
+        match self {
+            Self::Codex => vec![
+                "rate limit reached",
+                "rate_limit_error",
+                "429",
+                "too many requests",
+            ],
+            Self::Claude => vec![
+                "usage limit reached",
+                "rate limit reached",
+                "rate_limit_error",
+                "429",
+                "limit will reset",
+            ],
+        }
+    }
+
+    fn is_rate_limited(&self, stdout: &str, stderr: &str) -> bool {
+        let combined = format!("{}{}", stdout, stderr).to_lowercase();
+        self.rate_limit_patterns()
+            .iter()
+            .any(|pattern| combined.contains(pattern))
+    }
+
+    fn invoke(&self, prompt: &str) -> Result<(String, String)> {
+        let mut child = Command::new(self.command())
+            .args(self.args())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to spawn {} process. Is {} CLI installed?",
+                    self.name(),
+                    self.name()
+                )
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(prompt.as_bytes())?;
+        }
+
+        let output = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        Ok((stdout, stderr))
+    }
+}
+
+/// Manages multiple LLM tools with automatic fallback
+struct LlmToolChain {
+    tools: Vec<LlmTool>,
+    current_index: usize,
+}
+
+impl LlmToolChain {
+    fn new(tool_names: &str) -> Result<Self> {
+        let tools: Result<Vec<_>> = tool_names
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(LlmTool::from_name)
+            .collect();
+
+        let tools = tools?;
+
+        if tools.is_empty() {
+            anyhow::bail!("No valid LLM tools specified");
+        }
+
+        Ok(Self {
+            tools,
+            current_index: 0,
+        })
+    }
+
+    fn current_tool(&self) -> &LlmTool {
+        &self.tools[self.current_index]
+    }
+
+    fn has_fallback(&self) -> bool {
+        self.current_index < self.tools.len() - 1
+    }
+
+    fn switch_to_next(&mut self) -> Option<&LlmTool> {
+        if self.has_fallback() {
+            self.current_index += 1;
+            Some(self.current_tool())
+        } else {
+            None
+        }
+    }
+
+    fn invoke_with_fallback(&mut self, prompt: &str) -> Result<(String, String)> {
+        loop {
+            let tool = self.current_tool();
+            println!("Using LLM tool: {}", tool.name());
+
+            match tool.invoke(prompt) {
+                Ok((stdout, stderr)) => {
+                    if tool.is_rate_limited(&stdout, &stderr) {
+                        println!(
+                            "Rate limit detected for {}",
+                            tool.name()
+                        );
+
+                        if let Some(next_tool) = self.switch_to_next() {
+                            println!(
+                                "Switching to fallback tool: {}",
+                                next_tool.name()
+                            );
+                            continue;
+                        } else {
+                            anyhow::bail!("All LLM tools exhausted due to rate limits");
+                        }
+                    }
+
+                    return Ok((stdout, stderr));
+                }
+                Err(e) => {
+                    println!(
+                        "Error invoking {}: {}",
+                        tool.name(),
+                        e
+                    );
+
+                    if let Some(next_tool) = self.switch_to_next() {
+                        println!(
+                            "Switching to fallback tool: {}",
+                            next_tool.name()
+                        );
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "afkcode")]
+#[command(about = "LLM-powered checklist management and autonomous development loop")]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run the controller/worker loop against a checklist
+    Run {
+        /// Path to the persistent checklist file
+        checklist: PathBuf,
+
+        /// Custom controller prompt template
+        #[arg(long, default_value = DEFAULT_CONTROLLER_PROMPT)]
+        controller_prompt: String,
+
+        /// Custom worker prompt template
+        #[arg(long, default_value = DEFAULT_WORKER_PROMPT)]
+        worker_prompt: String,
+
+        /// Completion detection token
+        #[arg(long, default_value = DEFAULT_COMPLETION_TOKEN)]
+        completion_token: String,
+
+        /// Delay between LLM invocations in seconds
+        #[arg(long, default_value = "15")]
+        sleep_seconds: u64,
+
+        /// Comma-separated list of LLM tools to try (codex, claude)
+        #[arg(long, default_value = "codex,claude")]
+        tools: String,
+    },
+
+    /// Initialize a new bare checklist with standing orders
+    Init {
+        /// Path to create the checklist file
+        checklist: PathBuf,
+
+        /// Title for the checklist
+        #[arg(short, long)]
+        title: Option<String>,
+
+        /// Include example sections
+        #[arg(short, long)]
+        examples: bool,
+    },
+
+    /// Generate a checklist from a high-level prompt using LLM
+    Generate {
+        /// Path to create the checklist file
+        checklist: PathBuf,
+
+        /// High-level description of what to build
+        prompt: String,
+
+        /// Comma-separated list of LLM tools to try
+        #[arg(long, default_value = "codex,claude")]
+        tools: String,
+    },
+
+    /// Add a single item to the checklist
+    Add {
+        /// Path to the checklist file
+        checklist: PathBuf,
+
+        /// Item text to add
+        item: String,
+
+        /// Add as a sub-item (indented)
+        #[arg(short, long)]
+        sub: bool,
+
+        /// Section to add to (default: end of file)
+        #[arg(short = 's', long)]
+        section: Option<String>,
+    },
+
+    /// Add multiple items using LLM to expand a high-level description
+    AddBatch {
+        /// Path to the checklist file
+        checklist: PathBuf,
+
+        /// High-level description of items to add
+        description: String,
+
+        /// Comma-separated list of LLM tools to try
+        #[arg(long, default_value = "codex,claude")]
+        tools: String,
+    },
+
+    /// Remove items from the checklist
+    Remove {
+        /// Path to the checklist file
+        checklist: PathBuf,
+
+        /// Pattern to match for removal (substring match)
+        pattern: String,
+
+        /// Confirm removal without prompting
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Update/maintain checklist items using LLM
+    Update {
+        /// Path to the checklist file
+        checklist: PathBuf,
+
+        /// Instructions for updating the checklist
+        instruction: String,
+
+        /// Comma-separated list of LLM tools to try
+        #[arg(long, default_value = "codex,claude")]
+        tools: String,
+    },
+}
+
+fn fill_placeholders(template: &str, checklist: &str, completion_token: &str) -> String {
+    template
+        .replace("{checklist}", checklist)
+        .replace("{completion_token}", completion_token)
+        .trim()
+        .to_string()
+}
+
+fn build_prompt(checklist_path: &str, prompt_template: &str, completion_token: &str) -> String {
+    let rendered_body = fill_placeholders(prompt_template, checklist_path, completion_token);
+    format!("@{}\n\n{}\n", checklist_path, rendered_body)
+}
+
+fn stream_outputs(label: &str, stdout: &str, stderr: &str) {
+    println!("\n--- {} OUTPUT ---", label.to_uppercase());
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    println!("--- END {} OUTPUT ---\n", label.to_uppercase());
+    let _ = io::stdout().flush();
+}
+
+fn completion_detected(stdout: &str, completion_token: &str) -> bool {
+    stdout.contains(completion_token)
+}
+
+fn cmd_run(
+    checklist: PathBuf,
+    controller_prompt: String,
+    worker_prompt: String,
+    completion_token: String,
+    sleep_seconds: u64,
+    tools: String,
+) -> Result<()> {
+    // Ensure checklist file exists
+    if let Some(parent) = checklist.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !checklist.exists() {
+        fs::File::create(&checklist)?;
+    }
+
+    let checklist_path = checklist
+        .to_str()
+        .context("Checklist path contains invalid UTF-8")?;
+
+    let prompts = [("controller", &controller_prompt), ("worker", &worker_prompt)];
+
+    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let mut iteration = 0;
+
+    loop {
+        let (label, prompt_template) = prompts[iteration % prompts.len()];
+        let prompt_text = build_prompt(checklist_path, prompt_template, &completion_token);
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        println!("\n[{}] Running {} prompt...", timestamp, label);
+        let _ = io::stdout().flush();
+
+        let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt_text)?;
+        stream_outputs(label, &stdout, &stderr);
+
+        if label == "controller" && completion_detected(&stdout, &completion_token) {
+            println!(
+                "Completion token '{}' detected. Exiting loop.",
+                completion_token
+            );
+            break;
+        }
+
+        iteration += 1;
+        println!("Sleeping {} seconds before next prompt...", sleep_seconds);
+        let _ = io::stdout().flush();
+        thread::sleep(Duration::from_secs(sleep_seconds));
+    }
+
+    Ok(())
+}
+
+fn cmd_init(checklist: PathBuf, title: Option<String>, examples: bool) -> Result<()> {
+    if checklist.exists() {
+        anyhow::bail!(
+            "Checklist file already exists: {}",
+            checklist.display()
+        );
+    }
+
+    if let Some(parent) = checklist.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let title_text = title.unwrap_or_else(|| "Project Checklist".to_string());
+
+    let mut content = format!("# {}\n\n", title_text);
+    content.push_str(STANDING_ORDERS);
+    content.push_str("\n\n");
+
+    if examples {
+        content.push_str(
+            r#"# High-Level Requirements
+- [ ] Requirement 1
+- [ ] Requirement 2
+- [ ] Requirement 3
+
+# Tasks
+- [ ] Task 1
+- [ ] Task 2
+    - [ ] Subtask 2.1
+    - [ ] Subtask 2.2
+
+# Notes
+Additional context or documentation goes here.
+"#,
+        );
+    }
+
+    fs::write(&checklist, content)?;
+    println!("Created checklist: {}", checklist.display());
+
+    Ok(())
+}
+
+fn cmd_generate(checklist: PathBuf, prompt: String, tools: String) -> Result<()> {
+    if checklist.exists() {
+        anyhow::bail!(
+            "Checklist file already exists: {}",
+            checklist.display()
+        );
+    }
+
+    let generation_prompt = format!(
+        r#"Generate a detailed project checklist in Markdown format based on this description:
+
+{}
+
+The checklist should:
+1. Start with a clear project title as an H1 heading
+2. Include high-level requirements
+3. Break down requirements into specific tasks
+4. Use [ ] for unchecked items
+5. Include sub-items where appropriate (indented with 4 spaces)
+6. Be actionable and specific
+7. Focus on design and coding activities only
+8. Do NOT include the standing orders (they will be prepended automatically)
+
+Output ONLY the checklist content in Markdown format, nothing else.
+"#,
+        prompt
+    );
+
+    println!("Generating checklist...");
+    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&generation_prompt)?;
+
+    if stdout.trim().is_empty() {
+        anyhow::bail!("LLM returned empty response");
+    }
+
+    // Combine standing orders with generated content
+    let mut full_content = String::new();
+
+    // Extract title if present in generated content
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut content_start = 0;
+
+    if let Some(first_line) = lines.first() {
+        if first_line.starts_with("# ") {
+            full_content.push_str(first_line);
+            full_content.push_str("\n\n");
+            content_start = 1;
+        } else {
+            full_content.push_str("# Generated Project Checklist\n\n");
+        }
+    }
+
+    full_content.push_str(STANDING_ORDERS);
+    full_content.push_str("\n\n");
+
+    // Add the rest of the generated content
+    for line in &lines[content_start..] {
+        full_content.push_str(line);
+        full_content.push('\n');
+    }
+
+    if let Some(parent) = checklist.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(&checklist, full_content)?;
+    println!("Generated checklist: {}", checklist.display());
+
+    Ok(())
+}
+
+fn cmd_add(
+    checklist: PathBuf,
+    item: String,
+    sub: bool,
+    section: Option<String>,
+) -> Result<()> {
+    if !checklist.exists() {
+        anyhow::bail!("Checklist file does not exist: {}", checklist.display());
+    }
+
+    let content = fs::read_to_string(&checklist)?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    let indent = if sub { "    " } else { "" };
+    let new_item = format!("{}[ ] {}", indent, item);
+
+    let insert_pos = if let Some(section_name) = section {
+        // Find the section and insert after it
+        let mut found = false;
+        let mut pos = lines.len();
+
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with('#') && line.contains(&section_name) {
+                found = true;
+                // Skip to the next non-empty line after the section header
+                pos = i + 1;
+                while pos < lines.len() && lines[pos].trim().is_empty() {
+                    pos += 1;
+                }
+                break;
+            }
+        }
+
+        if !found {
+            anyhow::bail!("Section '{}' not found in checklist", section_name);
+        }
+        pos
+    } else {
+        // Append to end
+        lines.len()
+    };
+
+    lines.insert(insert_pos, new_item);
+
+    let updated_content = lines.join("\n") + "\n";
+    fs::write(&checklist, updated_content)?;
+
+    println!("Added item to {}", checklist.display());
+
+    Ok(())
+}
+
+fn cmd_add_batch(checklist: PathBuf, description: String, tools: String) -> Result<()> {
+    if !checklist.exists() {
+        anyhow::bail!("Checklist file does not exist: {}", checklist.display());
+    }
+
+    let checklist_path = checklist
+        .to_str()
+        .context("Checklist path contains invalid UTF-8")?;
+
+    let batch_prompt = format!(
+        r#"@{}
+
+Review the checklist above. Based on this high-level description:
+
+{}
+
+Generate a list of specific, actionable checklist items to add. Output ONLY the checklist items in this exact format:
+- [ ] Item 1
+- [ ] Item 2
+    - [ ] Sub-item 2.1
+
+Do not include explanations, headers, or any other text. Just the checkbox items.
+"#,
+        checklist_path, description
+    );
+
+    println!("Generating items...");
+    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&batch_prompt)?;
+
+    let content = fs::read_to_string(&checklist)?;
+    let mut new_content = content;
+
+    // Append generated items
+    if !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    new_content.push_str("\n# Generated Items\n");
+    new_content.push_str(&stdout);
+
+    fs::write(&checklist, new_content)?;
+    println!("Added batch items to {}", checklist.display());
+
+    Ok(())
+}
+
+fn cmd_remove(checklist: PathBuf, pattern: String, yes: bool) -> Result<()> {
+    if !checklist.exists() {
+        anyhow::bail!("Checklist file does not exist: {}", checklist.display());
+    }
+
+    let content = fs::read_to_string(&checklist)?;
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    let matching_indices: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&pattern))
+        .map(|(i, line)| (i, line.clone()))
+        .collect();
+
+    if matching_indices.is_empty() {
+        println!("No items match pattern: {}", pattern);
+        return Ok(());
+    }
+
+    println!("Found {} matching item(s):", matching_indices.len());
+    for (i, line) in &matching_indices {
+        println!("  [{}] {}", i, line);
+    }
+
+    if !yes {
+        print!("\nRemove these items? [y/N] ");
+        io::stdout().flush()?;
+
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+
+        if !response.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let indices_to_remove: std::collections::HashSet<usize> =
+        matching_indices.iter().map(|(i, _)| *i).collect();
+
+    let filtered_lines: Vec<String> = lines
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !indices_to_remove.contains(i))
+        .map(|(_, line)| line)
+        .collect();
+
+    let updated_content = filtered_lines.join("\n") + "\n";
+    fs::write(&checklist, updated_content)?;
+
+    println!("Removed {} item(s)", matching_indices.len());
+
+    Ok(())
+}
+
+fn cmd_update(checklist: PathBuf, instruction: String, tools: String) -> Result<()> {
+    if !checklist.exists() {
+        anyhow::bail!("Checklist file does not exist: {}", checklist.display());
+    }
+
+    let checklist_path = checklist
+        .to_str()
+        .context("Checklist path contains invalid UTF-8")?;
+
+    let update_prompt = format!(
+        r#"@{}
+
+{}
+
+Update the checklist according to the instruction above. Output the COMPLETE updated checklist, preserving all standing orders and existing content. Make only the requested changes.
+"#,
+        checklist_path, instruction
+    );
+
+    println!("Updating checklist...");
+    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&update_prompt)?;
+
+    // Create backup
+    let backup_path = checklist.with_extension("md.bak");
+    fs::copy(&checklist, &backup_path)?;
+    println!("Created backup: {}", backup_path.display());
+
+    fs::write(&checklist, stdout)?;
+    println!("Updated checklist: {}", checklist.display());
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    // Handle Ctrl+C gracefully
+    ctrlc::set_handler(|| {
+        println!("\nInterrupted. Exiting.");
+        std::process::exit(0);
+    })
+    .context("Error setting Ctrl-C handler")?;
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            checklist,
+            controller_prompt,
+            worker_prompt,
+            completion_token,
+            sleep_seconds,
+            tools,
+        } => cmd_run(
+            checklist,
+            controller_prompt,
+            worker_prompt,
+            completion_token,
+            sleep_seconds,
+            tools,
+        ),
+        Commands::Init {
+            checklist,
+            title,
+            examples,
+        } => cmd_init(checklist, title, examples),
+        Commands::Generate {
+            checklist,
+            prompt,
+            tools,
+        } => cmd_generate(checklist, prompt, tools),
+        Commands::Add {
+            checklist,
+            item,
+            sub,
+            section,
+        } => cmd_add(checklist, item, sub, section),
+        Commands::AddBatch {
+            checklist,
+            description,
+            tools,
+        } => cmd_add_batch(checklist, description, tools),
+        Commands::Remove {
+            checklist,
+            pattern,
+            yes,
+        } => cmd_remove(checklist, pattern, yes),
+        Commands::Update {
+            checklist,
+            instruction,
+            tools,
+        } => cmd_update(checklist, instruction, tools),
+    }
+}
