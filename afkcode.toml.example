@@ -12,6 +12,12 @@ tools = "codex,claude"
 # Increase to reduce API usage and avoid rate limits
 sleep_seconds = 15
 
+# Log file path for streaming output during run mode
+# Default: "afkcode.log"
+# All console output will be mirrored to this file
+# Uncomment and customize if needed:
+# log_file = "afkcode.log"
+
 # Controller prompt template
 # Default: built-in template
 # Available placeholders: {checklist}, {completion_token}

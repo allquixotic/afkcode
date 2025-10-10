@@ -15,8 +15,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -26,9 +26,8 @@ const DEFAULT_COMPLETION_TOKEN: &str = "__ALL_TASKS_COMPLETE__";
 
 const DEFAULT_CONTROLLER_PROMPT: &str = r#"
 You are the controller in an autonomous development loop.
-Study the shared checklist in @{checklist}, summarize current progress, and update it as needed.
-Assign the next actionable task to the worker so momentum continues.
-If—and only if—all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
+Study the shared checklist in @{checklist}, and reduce the length of it by removing completely finished checklist items.
+If and only if all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
 "#;
 
 const DEFAULT_WORKER_PROMPT: &str = "@{checklist} Do the thing.";
@@ -62,6 +61,9 @@ struct Config {
 
     /// Completion detection token
     completion_token: Option<String>,
+
+    /// Log file path for streaming output
+    log_file: Option<String>,
 }
 
 impl Config {
@@ -231,24 +233,36 @@ impl LlmToolChain {
         }
     }
 
-    fn invoke_with_fallback(&mut self, prompt: &str) -> Result<(String, String)> {
+    fn invoke_with_fallback(&mut self, prompt: &str, logger: &mut Option<Logger>) -> Result<(String, String)> {
         loop {
             let tool = self.current_tool();
-            println!("Using LLM tool: {}", tool.name());
+            let tool_msg = format!("Using LLM tool: {}", tool.name());
+            println!("{}", tool_msg);
+            if let Some(log) = logger.as_mut() {
+                let _ = log.logln(&tool_msg);
+            }
 
             match tool.invoke(prompt) {
                 Ok((stdout, stderr)) => {
                     if tool.is_rate_limited(&stdout, &stderr) {
-                        println!(
+                        let rate_limit_msg = format!(
                             "Rate limit detected for {}",
                             tool.name()
                         );
+                        println!("{}", rate_limit_msg);
+                        if let Some(log) = logger.as_mut() {
+                            let _ = log.logln(&rate_limit_msg);
+                        }
 
                         if let Some(next_tool) = self.switch_to_next() {
-                            println!(
+                            let switch_msg = format!(
                                 "Switching to fallback tool: {}",
                                 next_tool.name()
                             );
+                            println!("{}", switch_msg);
+                            if let Some(log) = logger.as_mut() {
+                                let _ = log.logln(&switch_msg);
+                            }
                             continue;
                         } else {
                             anyhow::bail!("All LLM tools exhausted due to rate limits");
@@ -258,17 +272,25 @@ impl LlmToolChain {
                     return Ok((stdout, stderr));
                 }
                 Err(e) => {
-                    println!(
+                    let error_msg = format!(
                         "Error invoking {}: {}",
                         tool.name(),
                         e
                     );
+                    println!("{}", error_msg);
+                    if let Some(log) = logger.as_mut() {
+                        let _ = log.logln(&error_msg);
+                    }
 
                     if let Some(next_tool) = self.switch_to_next() {
-                        println!(
+                        let switch_msg = format!(
                             "Switching to fallback tool: {}",
                             next_tool.name()
                         );
+                        println!("{}", switch_msg);
+                        if let Some(log) = logger.as_mut() {
+                            let _ = log.logln(&switch_msg);
+                        }
                         continue;
                     } else {
                         return Err(e);
@@ -276,6 +298,39 @@ impl LlmToolChain {
                 }
             }
         }
+    }
+}
+
+/// Logger for streaming output to both console and file with buffered writing
+struct Logger {
+    writer: BufWriter<std::fs::File>,
+}
+
+impl Logger {
+    fn new(log_path: &str) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("Failed to open log file: {}", log_path))?;
+
+        Ok(Self {
+            writer: BufWriter::with_capacity(8192, file),
+        })
+    }
+
+    fn log(&mut self, message: &str) -> Result<()> {
+        self.writer.write_all(message.as_bytes())?;
+        // Flush periodically to ensure responsive logging
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn logln(&mut self, message: &str) -> Result<()> {
+        self.writer.write_all(message.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        Ok(())
     }
 }
 
@@ -318,6 +373,10 @@ enum Commands {
         /// Comma-separated list of LLM tools to try (codex, claude)
         #[arg(long, default_value = "codex,claude")]
         tools: String,
+
+        /// Log file path for streaming output
+        #[arg(long, default_value = "afkcode.log")]
+        log_file: String,
     },
 
     /// Initialize a new bare checklist with standing orders
@@ -417,15 +476,33 @@ fn build_prompt(checklist_path: &str, prompt_template: &str, completion_token: &
     format!("@{}\n\n{}\n", checklist_path, rendered_body)
 }
 
-fn stream_outputs(label: &str, stdout: &str, stderr: &str) {
-    println!("\n--- {} OUTPUT ---", label.to_uppercase());
+fn stream_outputs(label: &str, stdout: &str, stderr: &str, logger: &mut Option<Logger>) {
+    let header = format!("\n--- {} OUTPUT ---", label.to_uppercase());
+    let footer = format!("--- END {} OUTPUT ---\n", label.to_uppercase());
+
+    println!("{}", header);
+    if let Some(log) = logger.as_mut() {
+        let _ = log.logln(&header);
+    }
+
     if !stdout.is_empty() {
         print!("{}", stdout);
+        if let Some(log) = logger.as_mut() {
+            let _ = log.log(stdout);
+        }
     }
     if !stderr.is_empty() {
         eprint!("{}", stderr);
+        if let Some(log) = logger.as_mut() {
+            let _ = log.log(stderr);
+        }
     }
-    println!("--- END {} OUTPUT ---\n", label.to_uppercase());
+
+    println!("{}", footer);
+    if let Some(log) = logger.as_mut() {
+        let _ = log.logln(&footer);
+    }
+
     let _ = io::stdout().flush();
 }
 
@@ -440,6 +517,7 @@ fn cmd_run(
     completion_token: String,
     sleep_seconds: u64,
     tools: String,
+    log_file: String,
 ) -> Result<()> {
     // Ensure checklist file exists
     if let Some(parent) = checklist.parent() {
@@ -448,6 +526,19 @@ fn cmd_run(
     if !checklist.exists() {
         fs::File::create(&checklist)?;
     }
+
+    // Initialize logger
+    let mut logger = match Logger::new(&log_file) {
+        Ok(log) => {
+            println!("Logging to: {}", log_file);
+            Some(log)
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to create log file '{}': {}", log_file, e);
+            eprintln!("Continuing without logging to file.");
+            None
+        }
+    };
 
     let checklist_path = checklist
         .to_str()
@@ -463,22 +554,34 @@ fn cmd_run(
         let prompt_text = build_prompt(checklist_path, prompt_template, &completion_token);
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        println!("\n[{}] Running {} prompt...", timestamp, label);
+        let timestamp_msg = format!("\n[{}] Running {} prompt...", timestamp, label);
+        println!("{}", timestamp_msg);
+        if let Some(log) = logger.as_mut() {
+            let _ = log.logln(&timestamp_msg);
+        }
         let _ = io::stdout().flush();
 
-        let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt_text)?;
-        stream_outputs(label, &stdout, &stderr);
+        let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt_text, &mut logger)?;
+        stream_outputs(label, &stdout, &stderr, &mut logger);
 
         if label == "controller" && completion_detected(&stdout, &completion_token) {
-            println!(
+            let completion_msg = format!(
                 "Completion token '{}' detected. Exiting loop.",
                 completion_token
             );
+            println!("{}", completion_msg);
+            if let Some(log) = logger.as_mut() {
+                let _ = log.logln(&completion_msg);
+            }
             break;
         }
 
         iteration += 1;
-        println!("Sleeping {} seconds before next prompt...", sleep_seconds);
+        let sleep_msg = format!("Sleeping {} seconds before next prompt...", sleep_seconds);
+        println!("{}", sleep_msg);
+        if let Some(log) = logger.as_mut() {
+            let _ = log.logln(&sleep_msg);
+        }
         let _ = io::stdout().flush();
         thread::sleep(Duration::from_secs(sleep_seconds));
     }
@@ -559,7 +662,8 @@ Output ONLY the checklist content in Markdown format, nothing else.
 
     println!("Generating checklist...");
     let mut tool_chain = LlmToolChain::new(&tools)?;
-    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&generation_prompt)?;
+    let mut logger = None;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&generation_prompt, &mut logger)?;
 
     if stdout.trim().is_empty() {
         anyhow::bail!("LLM returned empty response");
@@ -681,7 +785,8 @@ Do not include explanations, headers, or any other text. Just the checkbox items
 
     println!("Generating items...");
     let mut tool_chain = LlmToolChain::new(&tools)?;
-    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&batch_prompt)?;
+    let mut logger = None;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&batch_prompt, &mut logger)?;
 
     let content = fs::read_to_string(&checklist)?;
     let mut new_content = content;
@@ -778,7 +883,8 @@ Update the checklist according to the instruction above. Output the COMPLETE upd
 
     println!("Updating checklist...");
     let mut tool_chain = LlmToolChain::new(&tools)?;
-    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&update_prompt)?;
+    let mut logger = None;
+    let (stdout, _stderr) = tool_chain.invoke_with_fallback(&update_prompt, &mut logger)?;
 
     // Verify standing orders are preserved
     let mut updated_content = stdout;
@@ -858,6 +964,7 @@ fn main() -> Result<()> {
             completion_token,
             sleep_seconds,
             tools,
+            log_file,
         } => {
             // Merge config with CLI args
             let merged_controller_prompt = config.merge_with_cli(
@@ -885,6 +992,11 @@ fn main() -> Result<()> {
                 config.tools.clone(),
                 "codex,claude".to_string(),
             );
+            let merged_log_file = config.merge_with_cli(
+                log_file.clone(),
+                config.log_file.clone(),
+                "afkcode.log".to_string(),
+            );
 
             cmd_run(
                 checklist,
@@ -893,6 +1005,7 @@ fn main() -> Result<()> {
                 merged_completion_token,
                 merged_sleep_seconds,
                 merged_tools,
+                merged_log_file,
             )
         }
         Commands::Init {

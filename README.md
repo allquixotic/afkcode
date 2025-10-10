@@ -10,6 +10,7 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 - **Standing Orders**: Built-in project invariants ensure consistent LLM behavior
 - **Multi-LLM Support**: Automatic fallback between Codex CLI and Claude Code on rate limits
 - **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted
+- **Output Logging**: Automatically streams all LLM output and console messages to a configurable log file during run mode
 
 ## Installation
 
@@ -54,6 +55,7 @@ Options:
   --completion-token <TOKEN>         Completion detection string
   --sleep-seconds <N>                Delay between iterations (default: 15)
   --tools <TOOLS>                    Comma-separated list of LLM tools (default: codex,claude)
+  --log-file <PATH>                  Log file path for streaming output (default: afkcode.log)
 ```
 
 **Examples:**
@@ -81,6 +83,9 @@ afkcode run project.md --tools codex,claude --sleep-seconds 30
 - Controller emits completion token (default: `__ALL_TASKS_COMPLETE__`)
 - All LLM tools exhausted due to rate limits
 - User presses Ctrl+C
+
+**Output Logging:**
+All console output during run mode (LLM responses, status messages, errors) is automatically streamed to a log file (default: `afkcode.log`). This can be customized via the `--log-file` CLI argument or the `log_file` config option. The log file uses buffered writing to maintain responsiveness while capturing all output for later review.
 
 ### `init` - Create New Checklist
 
@@ -317,6 +322,10 @@ tools = "codex,claude"
 # Sleep duration between LLM calls in seconds
 # Default: 15
 sleep_seconds = 20
+
+# Log file path for streaming output during run mode
+# Default: "afkcode.log"
+log_file = "afkcode.log"
 
 # Controller prompt template
 # Default: built-in template (see below)
