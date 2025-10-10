@@ -1,0 +1,36 @@
+# afkcode Configuration File Example
+# Copy this file to afkcode.toml in your project directory and customize as needed
+# Configuration precedence: CLI args > config file > built-in defaults
+
+# LLM tools to use (comma-separated: codex, claude)
+# Default: "codex,claude"
+# Try tools in order, falling back on rate limits
+tools = "codex,claude"
+
+# Sleep duration between LLM calls in seconds
+# Default: 15
+# Increase to reduce API usage and avoid rate limits
+sleep_seconds = 15
+
+# Controller prompt template
+# Default: built-in template
+# Available placeholders: {checklist}, {completion_token}
+# Uncomment and customize if needed:
+# controller_prompt = """
+# You are the controller in an autonomous development loop.
+# Study the shared checklist in @{checklist}, summarize current progress, and update it as needed.
+# Assign the next actionable task to the worker so momentum continues.
+# If—and only if—all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
+# """
+
+# Worker prompt template
+# Default: "@{checklist} Do the thing."
+# Available placeholders: {checklist}
+# Uncomment and customize if needed:
+# worker_prompt = "@{checklist} Do the thing."
+
+# Completion detection token
+# Default: "__ALL_TASKS_COMPLETE__"
+# The controller outputs this when all work is done
+# Uncomment and customize if needed:
+# completion_token = "__ALL_TASKS_COMPLETE__"

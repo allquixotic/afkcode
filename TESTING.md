@@ -4,6 +4,13 @@
 
 The `smoke_test.sh` script provides comprehensive end-to-end testing of afkcode's functionality.
 
+### Recent Test Fixes
+
+The following bugs were identified and fixed via smoke test failures:
+- **Test 5**: Sub-item indentation now includes dash prefix (`    - [ ]`)
+- **Test 6**: Section-specific add now correctly inserts items in the specified section
+- **Test 14**: Standing orders are now automatically preserved during LLM updates
+
 ### Running the Tests
 
 ```bash

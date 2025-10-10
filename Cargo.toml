@@ -4,7 +4,9 @@ edition = "2024"
 version = "0.1.0"
 
 [dependencies]
-anyhow = "1.0.100"
-chrono = { version = "0.4.42", features = ["clock"] }
-clap = { version = "4.5.48", features = ["derive"] }
-ctrlc = "3.5.0"
+anyhow = "1"
+chrono = { version = "0", features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+serde = { version = "1", features = ["derive"] }
+toml = "0"

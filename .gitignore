@@ -47,3 +47,7 @@ tags
 .env
 .env.local
 *.log
+
+# afkcode user-specific config (but keep .example)
+afkcode.toml
+*.md.bak

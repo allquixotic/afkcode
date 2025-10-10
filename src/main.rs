@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -43,6 +44,59 @@ const STANDING_ORDERS: &str = r#"# STANDING ORDERS - DO NOT DELETE
 7. The command "Do the thing" means: review the remaining to-do items in this file; arbitrarily pick an important item to work on; do that item; update this file, removing 100% complete steps or adding sub-items to partially completed steps, then do a compile of affected projects, making sure they build, fixing errors if not; lastly, do a Git commit of changed files.
 8. The command "Fix shit" means: identify to-do items or known issues that are about *broken* code or design, i.e. things that have been left incomplete, code that doesn't compile (errors), or problems that need to be solved, then go solve them, then update this document and do a Git commit.
 "#;
+
+/// Configuration file structure
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Config {
+    /// LLM tools to use (comma-separated: codex, claude)
+    tools: Option<String>,
+
+    /// Sleep duration between LLM calls (in seconds)
+    sleep_seconds: Option<u64>,
+
+    /// Controller prompt template
+    controller_prompt: Option<String>,
+
+    /// Worker prompt template
+    worker_prompt: Option<String>,
+
+    /// Completion detection token
+    completion_token: Option<String>,
+}
+
+impl Config {
+    /// Load config from a file, or return default if file doesn't exist
+    fn load(path: &PathBuf) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        let config: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        Ok(config)
+    }
+
+    /// Merge this config with CLI args, where CLI args take precedence
+    fn merge_with_cli<T>(&self, cli_value: T, config_value: Option<T>, default_value: T) -> T
+    where
+        T: PartialEq + Clone,
+    {
+        // If CLI value differs from default, use CLI value
+        if cli_value != default_value {
+            cli_value
+        } else if let Some(config_val) = config_value {
+            // Otherwise use config value if present
+            config_val
+        } else {
+            // Fall back to default
+            default_value
+        }
+    }
+}
 
 /// LLM tool configuration and invocation logic
 #[derive(Debug, Clone)]
@@ -230,6 +284,10 @@ impl LlmToolChain {
 #[command(about = "LLM-powered checklist management and autonomous development loop")]
 #[command(version)]
 struct Cli {
+    /// Path to config file (defaults to afkcode.toml in current directory if it exists)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -557,7 +615,7 @@ fn cmd_add(
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
     let indent = if sub { "    " } else { "" };
-    let new_item = format!("{}[ ] {}", indent, item);
+    let new_item = format!("{}- [ ] {}", indent, item);
 
     let insert_pos = if let Some(section_name) = section {
         // Find the section and insert after it
@@ -702,6 +760,8 @@ fn cmd_update(checklist: PathBuf, instruction: String, tools: String) -> Result<
         anyhow::bail!("Checklist file does not exist: {}", checklist.display());
     }
 
+    let original_content = fs::read_to_string(&checklist)?;
+
     let checklist_path = checklist
         .to_str()
         .context("Checklist path contains invalid UTF-8")?;
@@ -720,12 +780,54 @@ Update the checklist according to the instruction above. Output the COMPLETE upd
     let mut tool_chain = LlmToolChain::new(&tools)?;
     let (stdout, _stderr) = tool_chain.invoke_with_fallback(&update_prompt)?;
 
+    // Verify standing orders are preserved
+    let mut updated_content = stdout;
+    if !updated_content.contains("# STANDING ORDERS") {
+        // LLM removed standing orders, restore them
+        println!("Warning: Standing orders were removed by LLM, restoring them...");
+
+        // Extract title from original content
+        let original_lines: Vec<&str> = original_content.lines().collect();
+        let mut new_content = String::new();
+
+        // Find and preserve the title
+        if let Some(first_line) = original_lines.first() {
+            if first_line.starts_with("# ") {
+                new_content.push_str(first_line);
+                new_content.push_str("\n\n");
+            }
+        }
+
+        // Add standing orders
+        new_content.push_str(STANDING_ORDERS);
+        new_content.push_str("\n\n");
+
+        // Add the LLM's content (skipping title if present)
+        let llm_lines: Vec<&str> = updated_content.lines().collect();
+        let mut skip_first = false;
+        if let Some(first_line) = llm_lines.first() {
+            if first_line.starts_with("# ") {
+                skip_first = true;
+            }
+        }
+
+        for (i, line) in llm_lines.iter().enumerate() {
+            if skip_first && i == 0 {
+                continue;
+            }
+            new_content.push_str(line);
+            new_content.push('\n');
+        }
+
+        updated_content = new_content;
+    }
+
     // Create backup
     let backup_path = checklist.with_extension("md.bak");
     fs::copy(&checklist, &backup_path)?;
     println!("Created backup: {}", backup_path.display());
 
-    fs::write(&checklist, stdout)?;
+    fs::write(&checklist, updated_content)?;
     println!("Updated checklist: {}", checklist.display());
 
     Ok(())
@@ -741,6 +843,13 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Load config from specified path or default afkcode.toml
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("afkcode.toml"));
+    let config = Config::load(&config_path)?;
+
     match cli.command {
         Commands::Run {
             checklist,
@@ -749,14 +858,43 @@ fn main() -> Result<()> {
             completion_token,
             sleep_seconds,
             tools,
-        } => cmd_run(
-            checklist,
-            controller_prompt,
-            worker_prompt,
-            completion_token,
-            sleep_seconds,
-            tools,
-        ),
+        } => {
+            // Merge config with CLI args
+            let merged_controller_prompt = config.merge_with_cli(
+                controller_prompt.clone(),
+                config.controller_prompt.clone(),
+                DEFAULT_CONTROLLER_PROMPT.to_string(),
+            );
+            let merged_worker_prompt = config.merge_with_cli(
+                worker_prompt.clone(),
+                config.worker_prompt.clone(),
+                DEFAULT_WORKER_PROMPT.to_string(),
+            );
+            let merged_completion_token = config.merge_with_cli(
+                completion_token.clone(),
+                config.completion_token.clone(),
+                DEFAULT_COMPLETION_TOKEN.to_string(),
+            );
+            let merged_sleep_seconds = config.merge_with_cli(
+                sleep_seconds,
+                config.sleep_seconds,
+                15u64,
+            );
+            let merged_tools = config.merge_with_cli(
+                tools.clone(),
+                config.tools.clone(),
+                "codex,claude".to_string(),
+            );
+
+            cmd_run(
+                checklist,
+                merged_controller_prompt,
+                merged_worker_prompt,
+                merged_completion_token,
+                merged_sleep_seconds,
+                merged_tools,
+            )
+        }
         Commands::Init {
             checklist,
             title,
@@ -766,7 +904,14 @@ fn main() -> Result<()> {
             checklist,
             prompt,
             tools,
-        } => cmd_generate(checklist, prompt, tools),
+        } => {
+            let merged_tools = config.merge_with_cli(
+                tools.clone(),
+                config.tools.clone(),
+                "codex,claude".to_string(),
+            );
+            cmd_generate(checklist, prompt, merged_tools)
+        }
         Commands::Add {
             checklist,
             item,
@@ -777,7 +922,14 @@ fn main() -> Result<()> {
             checklist,
             description,
             tools,
-        } => cmd_add_batch(checklist, description, tools),
+        } => {
+            let merged_tools = config.merge_with_cli(
+                tools.clone(),
+                config.tools.clone(),
+                "codex,claude".to_string(),
+            );
+            cmd_add_batch(checklist, description, merged_tools)
+        }
         Commands::Remove {
             checklist,
             pattern,
@@ -787,6 +939,13 @@ fn main() -> Result<()> {
             checklist,
             instruction,
             tools,
-        } => cmd_update(checklist, instruction, tools),
+        } => {
+            let merged_tools = config.merge_with_cli(
+                tools.clone(),
+                config.tools.clone(),
+                "codex,claude".to_string(),
+            );
+            cmd_update(checklist, instruction, merged_tools)
+        }
     }
 }

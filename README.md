@@ -287,6 +287,94 @@ afkcode run project.md \
   --worker-prompt "@{checklist} Implement the highest priority incomplete task."
 ```
 
+## Configuration
+
+### Configuration File Support
+
+afkcode supports TOML configuration files to avoid repeating common CLI arguments. Configuration precedence (highest to lowest):
+
+1. **CLI arguments** (always win)
+2. **Config file** (if present)
+3. **Built-in defaults** (fallback)
+
+### Default Configuration File
+
+afkcode automatically loads `afkcode.toml` from the current directory if it exists. You can also specify a custom config file:
+
+```bash
+afkcode --config /path/to/custom.toml run checklist.md
+```
+
+### Configuration File Format
+
+Create an `afkcode.toml` file in your project directory. See `afkcode.toml.example` for a complete example with all available options.
+
+```toml
+# LLM tools to use (comma-separated: codex, claude)
+# Default: "codex,claude"
+tools = "codex,claude"
+
+# Sleep duration between LLM calls in seconds
+# Default: 15
+sleep_seconds = 20
+
+# Controller prompt template
+# Default: built-in template (see below)
+controller_prompt = """
+You are the controller in an autonomous development loop.
+Study the shared checklist in @{checklist}, summarize current progress, and update it as needed.
+Assign the next actionable task to the worker so momentum continues.
+If—and only if—all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
+"""
+
+# Worker prompt template
+# Default: "@{checklist} Do the thing."
+worker_prompt = "@{checklist} Do the thing."
+
+# Completion detection token
+# Default: "__ALL_TASKS_COMPLETE__"
+completion_token = "__ALL_TASKS_COMPLETE__"
+```
+
+### Configuration Examples
+
+**Example 1**: Use Claude by default with longer sleep time
+```toml
+# afkcode.toml
+tools = "claude"
+sleep_seconds = 30
+```
+
+Then simply run:
+```bash
+afkcode run checklist.md  # Uses Claude with 30s sleep automatically
+```
+
+**Example 2**: Override config with CLI arguments
+```toml
+# afkcode.toml
+tools = "claude"
+sleep_seconds = 30
+```
+
+```bash
+# CLI args override config file
+afkcode run checklist.md --tools codex --sleep-seconds 10
+# Uses Codex with 10s sleep, not Claude with 30s
+```
+
+**Example 3**: Project-specific configurations
+```bash
+# Different config for each project
+cd project-a
+echo 'tools = "codex"' > afkcode.toml
+afkcode run checklist.md  # Uses Codex
+
+cd ../project-b
+echo 'tools = "claude"' > afkcode.toml
+afkcode run checklist.md  # Uses Claude
+```
+
 ## LLM Backend Configuration
 
 ### Supported Tools
@@ -417,6 +505,20 @@ cargo run -- init new.md --examples
 cargo run -- --help
 ```
 
+## Recent Changes
+
+### Bug Fixes
+
+- **Fixed sub-item formatting**: Sub-items now properly include the dash prefix (`    - [ ]` instead of `    [ ]`)
+- **Fixed section-specific add**: Items added with `--section` now correctly appear in the specified section
+- **Fixed standing orders preservation**: The `update` command now automatically restores standing orders if the LLM removes them
+
+### New Features
+
+- **Configuration file support**: Added `afkcode.toml` support for persistent configuration
+- **Global --config flag**: Specify custom configuration file paths
+- **Configuration precedence**: CLI args override config file values, which override defaults
+
 ## Differences from Python Version
 
 1. **Subcommands**: Not just a loop - full checklist management toolkit
@@ -426,6 +528,7 @@ cargo run -- --help
 5. **Better Error Handling**: Comprehensive error messages with anyhow
 6. **Type Safety**: Compile-time guarantees for correctness
 7. **Cross-Platform**: Works on Linux, macOS, Windows
+8. **Configuration Files**: TOML-based configuration for project-specific settings
 
 ## Contributing
 
