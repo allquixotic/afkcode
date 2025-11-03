@@ -4,10 +4,11 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 
 ## Features
 
-- **Autonomous Development Loop**: Alternates between controller and worker prompts to make continuous progress
+- **Autonomous Development Loop**: Worker-only loop by default, with optional controller/worker alternation
 - **Checklist Generation**: Create checklists from high-level prompts using LLM
 - **Checklist Management**: Add, remove, and update checklist items with or without LLM assistance
 - **Standing Orders**: Built-in project invariants ensure consistent LLM behavior
+- **Standing Orders Audit**: One-time alignment keeps in-repo Standing Orders synced with the core rules
 - **Multi-LLM Support**: Automatic fallback between Codex CLI and Claude Code on rate limits
 - **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted with temporary 5-minute squelching
 - **Completion Token Verification**: LLM confirms intentional completion to prevent accidental loop exits
@@ -45,7 +46,7 @@ afkcode remove my_project.md "DONE" --yes
 
 ### `run` - Autonomous Development Loop
 
-Runs the controller/worker loop against a checklist until completion or all LLM tools exhausted.
+Runs the worker loop against a checklist until completion or all LLM tools are exhausted. Use `--mode controller` to opt into the legacy controller/worker alternation.
 
 ```bash
 afkcode run <checklist> [OPTIONS]
@@ -55,6 +56,9 @@ Options:
   --worker-prompt <TEMPLATE>         Custom worker prompt
   --completion-token <TOKEN>         Completion detection string
   --sleep-seconds <N>                Delay between iterations (default: 15)
+  --mode <worker|controller>         Loop mode (default: worker)
+  --skip-audit                       Skip the Standing Orders alignment audit
+  --audit-orders-path <PATH>         Override the Standing Orders audit target file
   --tools <TOOLS>                    Comma-separated list of LLM tools (default: codex,claude)
   --log-file <PATH>                  Log file path for streaming output (default: afkcode.log)
 ```
@@ -70,6 +74,12 @@ afkcode run project.md --tools claude
 # Codex only (no fallback)
 afkcode run project.md --tools codex
 
+# Controller/worker alternation
+afkcode run project.md --mode controller
+
+# Skip the Standing Orders audit (not recommended)
+afkcode run project.md --skip-audit
+
 # Custom sleep time with fallback
 afkcode run project.md --tools codex,claude --sleep-seconds 30
 ```
@@ -83,19 +93,19 @@ afkcode run project.md --tools codex,claude --sleep-seconds 30
 6. Only exits if all tools exhausted or completion detected
 
 **Completion Token Verification:**
-When the completion token is detected in controller output:
-1. The system invokes an LLM to verify the token was intentionally emitted
-2. The LLM analyzes the output to distinguish deliberate completion from accidental mentions
-3. Only if the LLM confirms by emitting the token again does the loop exit
-4. This prevents false positives from LLM thinking/reasoning traces
+- **Worker mode**: The worker's stdout is scanned (case-insensitive) for the configured `completion_token`. If detected, afkcode runs a confirmation turn using a dedicated prompt. The loop exits only when the token appears again in that confirmation response; otherwise work resumes normally.
+- **Controller mode**: Unchanged. When the controller emits the completion token, afkcode asks the LLM to re-confirm intent before exiting.
 
 **Exit Conditions:**
-- Controller emits completion token (default: `__ALL_TASKS_COMPLETE__`) AND LLM confirms intent
+- Worker mode: Token appears in consecutive worker and confirmation turns
+- Controller mode: Controller emits completion token (default: `__ALL_TASKS_COMPLETE__`) **and** the verification prompt confirms intent
 - All LLM tools exhausted due to rate limits
 - User presses Ctrl+C
 
 **Output Logging:**
 All console output during run mode (LLM responses, status messages, errors) is automatically streamed to a log file (default: `afkcode.log`). This can be customized via the `--log-file` CLI argument or the `log_file` config option. The log file uses buffered writing to maintain responsiveness while capturing all output for later review.
+
+> Checklist hygiene (short bullets, removing completed items, using sub-items for partials) is enforced by the Standing Orders that live in your repository; afkcode does not rewrite checklist content during worker turns.
 
 ### `init` - Create New Checklist
 

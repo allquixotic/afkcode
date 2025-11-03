@@ -23,7 +23,7 @@ Checklists are Markdown files with this structure:
 # Project Title
 
 # STANDING ORDERS - DO NOT DELETE
-[8 numbered invariant rules]
+[9 numbered invariant rules]
 
 # High-Level Requirements
 - [ ] Requirement 1
@@ -50,8 +50,8 @@ Additional context
 
 These rules are **immutable** and govern all LLM behavior when working with checklists:
 
-### 1. Minimal Information Principle
-All additions to the checklist must contain only the minimum information needed for an LLM to understand the task. Avoid verbose descriptions.
+### 1. Minimal Information
+Keep each checklist item to the minimum details an LLM needs to act. Avoid verbose descriptions.
 
 **Good**: `[ ] Implement JWT authentication with RS256 signing`
 **Bad**: `[ ] We should probably think about adding some kind of authentication system, maybe using JWT tokens or something similar, with proper signing to ensure security`
@@ -78,13 +78,15 @@ When implementing a task, if you discover new work items, add them to the checkl
 Before finishing your work session, execute `git add` and `git commit` with a descriptive message summarizing changes made.
 
 ### 5. Standing Orders Immutability
-Never alter, delete, or rewrite the "STANDING ORDERS" section. This section is sacrosanct.
+The "STANDING ORDERS" section is immutable except during the one-time alignment step run by afkcode. Do not edit it in normal turns.
 
 ### 6. No Manual Work References
 Checklist items must **never** require manual human effort or mention testing. Focus only on:
 - Design activities
 - Coding activities
 - Automated processes
+
+Prefer automated testing workflows over manual spot checks.
 
 **Prohibited**: `[ ] Manually test the login flow in a browser`
 **Allowed**: `[ ] Implement automated integration tests for login flow`
@@ -115,6 +117,11 @@ When you receive this instruction, execute this workflow:
 2. **Fix**: Solve the identified problems
 3. **Update**: Modify checklist to reflect fixes
 4. **Commit**: Execute `git add` and `git commit`
+
+### 9. Stop Token Etiquette (Worker Mode)
+Emit the completion token on a line by itself only when every requirement is satisfied, no `[ ]` or `[~]` items remain, the code builds cleanly, and all changes are committed.
+
+> Checklist hygiene (short bullets, deleting completed items, using sub-items for partial work) is enforced by these Standing Orders; afkcode does not rewrite the checklist during worker turns.
 
 ## Invocation Modes
 
@@ -159,7 +166,7 @@ otherwise, do not print that string.
 When invoked through specific afkcode commands, understand the context:
 
 ### `run` Command
-You will alternate between controller and worker roles. Maintain continuity across iterations by reading the updated checklist each time.
+Worker mode is the default: you receive the worker prompt repeatedly, with a one-time standing-orders alignment turn at the start (unless the user skips it). If `--mode controller` is supplied, controller and worker turns alternate as before. Maintain continuity across iterations by reading the updated checklist each time.
 
 ### `generate` Command
 You are being asked to create a complete project checklist from a high-level description. Output ONLY:
@@ -365,19 +372,12 @@ __ALL_TASKS_COMPLETE__
 
 ## Completion Detection
 
-The loop terminates when the controller outputs the completion token (default: `__ALL_TASKS_COMPLETE__`).
+Worker mode and controller mode share the same completion token (default: `__ALL_TASKS_COMPLETE__`), but the exit rules differ:
 
-**Only output this token when**:
-1. All high-level requirements are satisfied
-2. All checklist items are complete (no `[ ]` or `[~]` items remain)
-3. Code compiles without errors
-4. All changes are committed
+- **Worker mode**: You may emit the token on a line by itself only when every requirement is satisfied, no `[ ]` or `[~]` items remain, the code builds cleanly, and all changes are committed. afkcode treats the token as a stop request, then issues a confirmation prompt; the loop exits only if you emit the token again in that confirmation turn.
+- **Controller mode**: Only the controller can emit the completion token. afkcode sends a verification prompt to confirm intent before exiting, just as in previous releases.
 
-**Never output this token**:
-- If any work remains incomplete
-- If code doesn't compile
-- If you're unsure about completion status
-- During worker iterations (only controller can signal completion)
+If anything remains incomplete or uncertain, do **not** emit the token.
 
 ## Summary
 

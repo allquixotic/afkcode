@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+mod prompts;
+
+use anyhow::{Context, Result, anyhow};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 const DEFAULT_COMPLETION_TOKEN: &str = "__ALL_TASKS_COMPLETE__";
 
@@ -31,18 +34,41 @@ Study the shared checklist in @{checklist}, and reduce the length of it by remov
 If and only if all high-level requirements and every checklist item are fully satisfied, output {completion_token} on a line by itself at the very end of your reply; otherwise, do not print that string.
 "#;
 
-const DEFAULT_WORKER_PROMPT: &str = "@{checklist} Do the thing.";
+const CORE_STANDING_ORDERS_VERSION: &str = "1";
 
-const STANDING_ORDERS: &str = r#"# STANDING ORDERS - DO NOT DELETE
+const CORE_STANDING_ORDERS_TEMPLATE: &str = r#"# STANDING ORDERS - DO NOT DELETE
 
-1. All additions to this document must be only the minimum amount of information for an LLM to understand the task.
-2. When an item is fully complete, remove it from the checklist entirely. If you only partially completed it, add a sub-item with the remaining work and put a ~ in the checkbox instead of an x.
-3. When you finish coding, if you discovered new items to work on during your work, add them to this document in the appropriate checklist. Be succinct.
-4. Before you finish your work, do a Git commit of files you have modified in this turn.
-5. Do not alter or delete any standing orders.
-6. Checklist items in this file must never require manual human effort or refer to testing of any kind, only design and coding activities.
-7. The command "Do the thing" means: review the remaining to-do items in this file; arbitrarily pick an important item to work on; do that item; update this file, removing 100% complete steps or adding sub-items to partially completed steps, then do a compile of affected projects, making sure they build, fixing errors if not; lastly, do a Git commit of changed files.
-8. The command "Fix shit" means: identify to-do items or known issues that are about *broken* code or design, i.e. things that have been left incomplete, code that doesn't compile (errors), or problems that need to be solved, then go solve them, then update this document and do a Git commit.
+1. Minimal Information: Checklist items contain only the minimum needed for an LLM to act.
+2. Completion Handling: Delete fully complete items. For partials, change `[ ]` to `[~]` and add sub-items for the remaining work.
+3. Discovery: Add newly discovered work as new (sub-)items, succinctly.
+4. Git Commit: Before finishing a work turn, run `git add` and `git commit` with a descriptive message summarizing changes.
+5. Immutability: The "STANDING ORDERS" section is immutable except during the one-time alignment step run by afkcode.
+6. No Manual Work: Do not require or mention manual human steps or manual testing; prefer automated tests and processes.
+7. "Do the thing": Review checklist, pick an important incomplete item, implement fully or partially, update checklist, build, fix errors, commit.
+8. "Fix shit": Identify broken code/design or incomplete implementations, fix, update checklist, commit.
+9. Stop Token Etiquette (Worker Mode): Emit `{completion_token}` on a line by itself at the very end ONLY when all requirements are met, no `[ ]` or `[~]` remain, the code builds cleanly, and all changes are committed.
+"#;
+
+const STANDING_ORDERS_AUDIT_PROMPT_TEMPLATE: &str = r#"You are aligning the repository's Standing Orders for afkcode's worker-only mode.
+
+Goals:
+- Make the Standing Orders section contain the immutable "core orders" shown below verbatim, followed by any project-specific orders that are relevant to THIS codebase (naming conventions, CI rules, code style, etc.).
+- Remove duplicates and obsolete or vague rules. Keep each bullet concise and actionable.
+- Project-specific additions must NOT contradict the core orders.
+
+Core orders (must appear exactly as provided, with {completion_token} expanded to the actual token):
+{CORE_STANDING_ORDERS_WITH_TOKEN_SUBSTITUTED}
+
+Input file: @{orders_file}   # This is either AGENTS.md or the Standing Orders block inside the checklist.
+Current contents of the target Standing Orders (or an empty placeholder if not present):
+@{orders_current}
+
+Instructions:
+1) Replace the Standing Orders in the target file so that it begins with the exact core orders above (with the correct completion token inserted), followed by a heading `# Project Standing Orders` (create it if missing) and any project-specific orders you retain or add.
+2) Do not include explanations, rationales, or commentary—ONLY the final file content.
+3) Ensure formatting is valid Markdown and indentation is 4 spaces for sub-items where applicable.
+
+Output ONLY the full updated file content (no prose).
 "#;
 
 /// Configuration file structure
@@ -65,6 +91,18 @@ struct Config {
 
     /// Log file path for streaming output
     log_file: Option<String>,
+
+    /// Run mode (worker or controller)
+    mode: Option<String>,
+
+    /// Optional path override for standing orders audit
+    orders_path: Option<String>,
+
+    /// Skip the standing orders audit on startup
+    skip_audit: Option<bool>,
+
+    /// Commit audit changes automatically
+    commit_audit: Option<bool>,
 }
 
 impl Config {
@@ -197,10 +235,8 @@ impl LlmTool {
         match self {
             Self::Claude => {
                 // For Claude Code, wrap the prompt with thinking_mode disabled
-                let wrapped_prompt = format!(
-                    "<thinking_mode>disabled</thinking_mode>\n\n{}",
-                    prompt
-                );
+                let wrapped_prompt =
+                    format!("<thinking_mode>disabled</thinking_mode>\n\n{}", prompt);
                 self.invoke(&wrapped_prompt)
             }
             Self::Codex => {
@@ -287,7 +323,8 @@ impl LlmToolChain {
 
     /// Mark a tool as rate limited with current timestamp
     fn mark_rate_limited(&mut self, tool: &LlmTool) {
-        self.rate_limit_timestamps.insert(tool.name().to_string(), Instant::now());
+        self.rate_limit_timestamps
+            .insert(tool.name().to_string(), Instant::now());
     }
 
     /// Check if a tool's rate limit has expired
@@ -318,7 +355,11 @@ impl LlmToolChain {
         }
     }
 
-    fn invoke_with_fallback(&mut self, prompt: &str, logger: &mut Option<Logger>) -> Result<(String, String)> {
+    fn invoke_with_fallback(
+        &mut self,
+        prompt: &str,
+        logger: &mut Option<Logger>,
+    ) -> Result<(String, String)> {
         // Try to reset to a more preferred tool if rate limit has expired
         self.try_reset_to_preferred(logger);
 
@@ -346,10 +387,8 @@ impl LlmToolChain {
                         }
 
                         if let Some(next_tool) = self.switch_to_next() {
-                            let switch_msg = format!(
-                                "Switching to fallback tool: {}",
-                                next_tool.name()
-                            );
+                            let switch_msg =
+                                format!("Switching to fallback tool: {}", next_tool.name());
                             println!("{}", switch_msg);
                             if let Some(log) = logger.as_mut() {
                                 let _ = log.logln(&switch_msg);
@@ -363,21 +402,15 @@ impl LlmToolChain {
                     return Ok((stdout, stderr));
                 }
                 Err(e) => {
-                    let error_msg = format!(
-                        "Error invoking {}: {}",
-                        tool.name(),
-                        e
-                    );
+                    let error_msg = format!("Error invoking {}: {}", tool.name(), e);
                     println!("{}", error_msg);
                     if let Some(log) = logger.as_mut() {
                         let _ = log.logln(&error_msg);
                     }
 
                     if let Some(next_tool) = self.switch_to_next() {
-                        let switch_msg = format!(
-                            "Switching to fallback tool: {}",
-                            next_tool.name()
-                        );
+                        let switch_msg =
+                            format!("Switching to fallback tool: {}", next_tool.name());
                         println!("{}", switch_msg);
                         if let Some(log) = logger.as_mut() {
                             let _ = log.logln(&switch_msg);
@@ -392,7 +425,11 @@ impl LlmToolChain {
     }
 
     /// Invoke with fallback, but with thinking disabled for simple verification tasks
-    fn invoke_with_fallback_without_thinking(&mut self, prompt: &str, logger: &mut Option<Logger>) -> Result<(String, String)> {
+    fn invoke_with_fallback_without_thinking(
+        &mut self,
+        prompt: &str,
+        logger: &mut Option<Logger>,
+    ) -> Result<(String, String)> {
         // Try to reset to a more preferred tool if rate limit has expired
         self.try_reset_to_preferred(logger);
 
@@ -420,10 +457,8 @@ impl LlmToolChain {
                         }
 
                         if let Some(next_tool) = self.switch_to_next() {
-                            let switch_msg = format!(
-                                "Switching to fallback tool: {}",
-                                next_tool.name()
-                            );
+                            let switch_msg =
+                                format!("Switching to fallback tool: {}", next_tool.name());
                             println!("{}", switch_msg);
                             if let Some(log) = logger.as_mut() {
                                 let _ = log.logln(&switch_msg);
@@ -437,21 +472,15 @@ impl LlmToolChain {
                     return Ok((stdout, stderr));
                 }
                 Err(e) => {
-                    let error_msg = format!(
-                        "Error invoking {}: {}",
-                        tool.name(),
-                        e
-                    );
+                    let error_msg = format!("Error invoking {}: {}", tool.name(), e);
                     println!("{}", error_msg);
                     if let Some(log) = logger.as_mut() {
                         let _ = log.logln(&error_msg);
                     }
 
                     if let Some(next_tool) = self.switch_to_next() {
-                        let switch_msg = format!(
-                            "Switching to fallback tool: {}",
-                            next_tool.name()
-                        );
+                        let switch_msg =
+                            format!("Switching to fallback tool: {}", next_tool.name());
                         println!("{}", switch_msg);
                         if let Some(log) = logger.as_mut() {
                             let _ = log.logln(&switch_msg);
@@ -512,6 +541,24 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum RunMode {
+    Worker,
+    Controller,
+}
+
+impl std::str::FromStr for RunMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "worker" => Ok(Self::Worker),
+            "controller" => Ok(Self::Controller),
+            other => Err(format!("Invalid run mode: {}", other)),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the controller/worker loop against a checklist
@@ -524,7 +571,7 @@ enum Commands {
         controller_prompt: String,
 
         /// Custom worker prompt template
-        #[arg(long, default_value = DEFAULT_WORKER_PROMPT)]
+        #[arg(long, default_value = prompts::DEFAULT_WORKER_PROMPT)]
         worker_prompt: String,
 
         /// Completion detection token
@@ -532,8 +579,24 @@ enum Commands {
         completion_token: String,
 
         /// Delay between LLM invocations in seconds
-        #[arg(long, default_value = "15")]
+        #[arg(long, default_value_t = 15)]
         sleep_seconds: u64,
+
+        /// Loop mode (worker-only default, or controller/worker alternation)
+        #[arg(long, value_enum, default_value_t = RunMode::Worker)]
+        mode: RunMode,
+
+        /// Skip the standing orders audit on startup
+        #[arg(long)]
+        skip_audit: bool,
+
+        /// Override the target file used for the standing orders audit
+        #[arg(long)]
+        audit_orders_path: Option<PathBuf>,
+
+        /// Disable committing the audit changes automatically
+        #[arg(long, hide = true)]
+        no_commit_audit: bool,
 
         /// Comma-separated list of LLM tools to try (codex, claude)
         #[arg(long, default_value = "codex,claude")]
@@ -628,6 +691,40 @@ enum Commands {
     },
 }
 
+struct RunConfig {
+    checklist: PathBuf,
+    checklist_path_str: String,
+    controller_prompt: String,
+    worker_prompt: String,
+    completion_token: String,
+    sleep_seconds: u64,
+    mode: RunMode,
+    skip_audit: bool,
+    audit_orders_path: Option<PathBuf>,
+    commit_audit: bool,
+}
+
+struct WorkerLoopState {
+    iteration: usize,
+    last_stdout: String,
+    saw_stop_token: bool,
+    audit_done: bool,
+}
+
+enum AuditTarget {
+    File {
+        path: PathBuf,
+        content: String,
+    },
+    ChecklistSection {
+        checklist_path: PathBuf,
+        checklist_content: String,
+        section_start: usize,
+        section_end: usize,
+        section_content: String,
+    },
+}
+
 fn fill_placeholders(template: &str, checklist: &str, completion_token: &str) -> String {
     template
         .replace("{checklist}", checklist)
@@ -639,6 +736,19 @@ fn fill_placeholders(template: &str, checklist: &str, completion_token: &str) ->
 fn build_prompt(checklist_path: &str, prompt_template: &str, completion_token: &str) -> String {
     let rendered_body = fill_placeholders(prompt_template, checklist_path, completion_token);
     format!("@{}\n\n{}\n", checklist_path, rendered_body)
+}
+
+fn render_core_standing_orders(completion_token: &str) -> String {
+    CORE_STANDING_ORDERS_TEMPLATE.replace("{completion_token}", completion_token)
+}
+
+fn contains_token(stdout: &str, completion_token: &str) -> bool {
+    if completion_token.is_empty() {
+        return false;
+    }
+    stdout
+        .to_lowercase()
+        .contains(&completion_token.to_lowercase())
 }
 
 fn stream_outputs(label: &str, stdout: &str, stderr: &str, logger: &mut Option<Logger>) {
@@ -669,6 +779,428 @@ fn stream_outputs(label: &str, stdout: &str, stderr: &str, logger: &mut Option<L
     }
 
     let _ = io::stdout().flush();
+}
+
+fn log_message(logger: &mut Option<Logger>, message: &str) {
+    println!("{}", message);
+    if let Some(log) = logger.as_mut() {
+        let _ = log.logln(message);
+    }
+    let _ = io::stdout().flush();
+}
+
+fn log_warning(logger: &mut Option<Logger>, message: &str) {
+    eprintln!("{}", message);
+    if let Some(log) = logger.as_mut() {
+        let _ = log.logln(message);
+    }
+    let _ = io::stderr().flush();
+}
+
+fn sleep_with_log(seconds: u64, logger: &mut Option<Logger>) {
+    let sleep_msg = format!("Sleeping {} seconds before next prompt...", seconds);
+    log_message(logger, &sleep_msg);
+    if seconds > 0 {
+        thread::sleep(Duration::from_secs(seconds));
+    }
+}
+
+fn run_worker_turn(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+    iteration: usize,
+) -> Result<String> {
+    let status = format!("mode=worker iteration={} turn=normal", iteration);
+    log_message(logger, &status);
+
+    let prompt = build_prompt(
+        &config.checklist_path_str,
+        &config.worker_prompt,
+        &config.completion_token,
+    );
+    let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
+    stream_outputs("worker", &stdout, &stderr, logger);
+    Ok(stdout)
+}
+
+fn run_stop_confirmation_turn(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+    iteration: usize,
+    previous_stdout: &str,
+) -> Result<String> {
+    let status = format!("mode=worker iteration={} turn=confirmation", iteration);
+    log_message(logger, &status);
+
+    let mut prompt = build_prompt(
+        &config.checklist_path_str,
+        prompts::STOP_CONFIRMATION_PROMPT,
+        &config.completion_token,
+    );
+    prompt.push_str("\nPrevious response:\n");
+    prompt.push_str(previous_stdout);
+    if !previous_stdout.ends_with('\n') {
+        prompt.push('\n');
+    }
+
+    let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
+    stream_outputs("confirmation", &stdout, &stderr, logger);
+    Ok(stdout)
+}
+
+fn run_worker_loop(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+) -> Result<()> {
+    let mut state = WorkerLoopState {
+        iteration: 1,
+        last_stdout: String::new(),
+        saw_stop_token: false,
+        audit_done: config.skip_audit,
+    };
+
+    if !config.skip_audit {
+        run_standing_orders_audit(config, tool_chain, logger)?;
+        state.audit_done = true;
+    }
+
+    loop {
+        if state.saw_stop_token {
+            let confirmation_stdout = run_stop_confirmation_turn(
+                config,
+                tool_chain,
+                logger,
+                state.iteration,
+                &state.last_stdout,
+            )?;
+
+            let confirmed = contains_token(&confirmation_stdout, &config.completion_token);
+            if confirmed {
+                log_message(logger, "Stop token confirmed; exiting.");
+                break;
+            }
+
+            state.saw_stop_token = false;
+            state.last_stdout = confirmation_stdout;
+            sleep_with_log(config.sleep_seconds, logger);
+            continue;
+        }
+
+        let stdout = run_worker_turn(config, tool_chain, logger, state.iteration)?;
+        state.saw_stop_token = contains_token(&stdout, &config.completion_token);
+        state.last_stdout = stdout;
+        state.iteration += 1;
+        sleep_with_log(config.sleep_seconds, logger);
+    }
+
+    let _ = state.audit_done;
+
+    Ok(())
+}
+
+fn run_controller_worker_loop(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+) -> Result<()> {
+    let prompts = [
+        ("controller", &config.controller_prompt),
+        ("worker", &config.worker_prompt),
+    ];
+
+    let mut iteration = 0;
+
+    loop {
+        let (label, prompt_template) = prompts[iteration % prompts.len()];
+        let prompt = build_prompt(
+            &config.checklist_path_str,
+            prompt_template,
+            &config.completion_token,
+        );
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let timestamp_msg = format!("\n[{}] Running {} prompt...", timestamp, label);
+        log_message(logger, &timestamp_msg);
+
+        let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
+        stream_outputs(label, &stdout, &stderr, logger);
+
+        if label == "controller" && completion_detected(&stdout, &config.completion_token) {
+            if verify_completion_intent(&stdout, &config.completion_token, tool_chain, logger)? {
+                break;
+            }
+        }
+
+        iteration += 1;
+        sleep_with_log(config.sleep_seconds, logger);
+    }
+
+    Ok(())
+}
+
+fn run_standing_orders_audit(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+) -> Result<()> {
+    let target = resolve_audit_target(config)?;
+    let (current_content, target_label) = match &target {
+        AuditTarget::File { path, content } => (content.clone(), path.display().to_string()),
+        AuditTarget::ChecklistSection {
+            checklist_path,
+            section_content,
+            ..
+        } => (
+            section_content.clone(),
+            format!("{} (Standing Orders section)", checklist_path.display()),
+        ),
+    };
+
+    log_message(
+        logger,
+        &format!("Running Standing Orders audit targeting {}", target_label),
+    );
+
+    let core_orders = render_core_standing_orders(&config.completion_token);
+
+    let mut _orders_file_temp: Option<NamedTempFile> = None;
+    let mut orders_current_temp = NamedTempFile::new().context("Failed to create temp file")?;
+    orders_current_temp
+        .write_all(current_content.as_bytes())
+        .context("Failed to write current Standing Orders snapshot")?;
+    orders_current_temp
+        .flush()
+        .context("Failed to flush Standing Orders snapshot")?;
+
+    let orders_current_path = orders_current_temp.path().to_string_lossy().to_string();
+
+    let orders_file_path = match &target {
+        AuditTarget::File { path, .. } => {
+            if !path.exists() {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create {}", parent.display()))?;
+                }
+                fs::write(path, &current_content)
+                    .with_context(|| format!("Failed to initialize {}", path.display()))?;
+            }
+            path.to_string_lossy().to_string()
+        }
+        AuditTarget::ChecklistSection { .. } => {
+            let mut temp = NamedTempFile::new().context("Failed to create temp file")?;
+            temp.write_all(current_content.as_bytes())
+                .context("Failed to write Standing Orders block")?;
+            temp.flush()
+                .context("Failed to flush Standing Orders block")?;
+            let path = temp.path().to_string_lossy().to_string();
+            _orders_file_temp = Some(temp);
+            path
+        }
+    };
+
+    let prompt_body = STANDING_ORDERS_AUDIT_PROMPT_TEMPLATE
+        .replace(
+            "{CORE_STANDING_ORDERS_WITH_TOKEN_SUBSTITUTED}",
+            &core_orders,
+        )
+        .replace("{completion_token}", &config.completion_token)
+        .replace("{orders_file}", &orders_file_path)
+        .replace("{orders_current}", &orders_current_path);
+
+    let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt_body, logger)?;
+    stream_outputs("audit", &stdout, &stderr, logger);
+
+    let mut rendered = stdout;
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+
+    let commit_path = match target {
+        AuditTarget::File { path, .. } => {
+            fs::write(&path, rendered)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            path
+        }
+        AuditTarget::ChecklistSection {
+            checklist_path,
+            checklist_content,
+            section_start,
+            section_end,
+            ..
+        } => {
+            let mut updated = String::with_capacity(checklist_content.len() + rendered.len());
+            updated.push_str(&checklist_content[..section_start]);
+            updated.push_str(&rendered);
+            updated.push_str(&checklist_content[section_end..]);
+            fs::write(&checklist_path, updated).with_context(|| {
+                format!(
+                    "Failed to update checklist {} with Standing Orders",
+                    checklist_path.display()
+                )
+            })?;
+            checklist_path
+        }
+    };
+
+    maybe_commit_audit_change(&commit_path, config, logger)?;
+
+    Ok(())
+}
+
+fn resolve_audit_target(config: &RunConfig) -> Result<AuditTarget> {
+    if let Some(path) = &config.audit_orders_path {
+        return load_file_audit_target(path);
+    }
+
+    let default_agents = PathBuf::from("AGENTS.md");
+    if default_agents.exists() {
+        return load_file_audit_target(&default_agents);
+    }
+
+    let checklist_content = fs::read_to_string(&config.checklist).with_context(|| {
+        format!(
+            "Failed to read checklist for audit: {}",
+            config.checklist.display()
+        )
+    })?;
+
+    if let Some((start, end, section_content)) = extract_standing_orders_block(&checklist_content) {
+        return Ok(AuditTarget::ChecklistSection {
+            checklist_path: config.checklist.clone(),
+            checklist_content,
+            section_start: start,
+            section_end: end,
+            section_content,
+        });
+    }
+
+    load_file_audit_target(&default_agents)
+}
+
+fn load_file_audit_target(path: &Path) -> Result<AuditTarget> {
+    let content = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        fs::write(path, "").with_context(|| format!("Failed to initialize {}", path.display()))?;
+        String::new()
+    };
+
+    Ok(AuditTarget::File {
+        path: path.to_path_buf(),
+        content,
+    })
+}
+
+fn extract_standing_orders_block(contents: &str) -> Option<(usize, usize, String)> {
+    let header = "# STANDING ORDERS - DO NOT DELETE";
+    let start = contents.find(header)?;
+
+    let bytes = contents.as_bytes();
+    let mut end = contents.len();
+    let mut first_line = true;
+    let mut idx = start;
+
+    while idx < contents.len() {
+        if bytes[idx] == b'\n' {
+            let next_line_start = idx + 1;
+            if next_line_start >= contents.len() {
+                end = contents.len();
+                break;
+            }
+
+            if first_line {
+                first_line = false;
+            } else if contents[next_line_start..].starts_with("# ")
+                || contents[next_line_start..].starts_with("## ")
+            {
+                end = idx + 1;
+                break;
+            }
+        }
+        idx += 1;
+    }
+
+    let section = contents[start..end].to_string();
+    Some((start, end, section))
+}
+
+fn maybe_commit_audit_change(
+    path: &Path,
+    config: &RunConfig,
+    logger: &mut Option<Logger>,
+) -> Result<()> {
+    if !config.commit_audit {
+        return Ok(());
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+
+    match Command::new("git").arg("add").arg(&path_str).status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            log_warning(
+                logger,
+                &format!(
+                    "Warning: git add {} returned non-zero status: {}",
+                    path_str, status
+                ),
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            log_warning(
+                logger,
+                &format!("Warning: failed to run git add {}: {}", path_str, e),
+            );
+            return Ok(());
+        }
+    }
+
+    let message = format!(
+        "afkcode: align Standing Orders (core v{})",
+        CORE_STANDING_ORDERS_VERSION
+    );
+
+    match Command::new("git")
+        .arg("commit")
+        .arg("-m")
+        .arg(&message)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            log_message(
+                logger,
+                &format!(
+                    "Standing Orders alignment committed with message: {}",
+                    message
+                ),
+            );
+        }
+        Ok(status) => {
+            log_warning(
+                logger,
+                &format!(
+                    "Warning: git commit returned status {} (likely no changes to commit)",
+                    status
+                ),
+            );
+        }
+        Err(e) => {
+            log_warning(
+                logger,
+                &format!("Warning: failed to run git commit for audit: {}", e),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn completion_detected(stdout: &str, completion_token: &str) -> bool {
@@ -739,6 +1271,10 @@ fn cmd_run(
     worker_prompt: String,
     completion_token: String,
     sleep_seconds: u64,
+    mode: RunMode,
+    skip_audit: bool,
+    audit_orders_path: Option<PathBuf>,
+    commit_audit: bool,
     tools: String,
     log_file: String,
 ) -> Result<()> {
@@ -763,46 +1299,36 @@ fn cmd_run(
         }
     };
 
-    let checklist_path = checklist
-        .to_str()
-        .context("Checklist path contains invalid UTF-8")?;
+    if let Some(log) = logger.as_mut() {
+        println!("Logging to: {}", log_file);
+        let _ = log.logln(&format!("Logging to: {}", log_file));
+    }
 
-    let prompts = [("controller", &controller_prompt), ("worker", &worker_prompt)];
+    let checklist_path_str = checklist
+        .to_str()
+        .context("Checklist path contains invalid UTF-8")?
+        .to_string();
+
+    let run_config = RunConfig {
+        checklist: checklist.clone(),
+        checklist_path_str,
+        controller_prompt,
+        worker_prompt,
+        completion_token,
+        sleep_seconds,
+        mode,
+        skip_audit,
+        audit_orders_path,
+        commit_audit,
+    };
 
     let mut tool_chain = LlmToolChain::new(&tools)?;
-    let mut iteration = 0;
 
-    loop {
-        let (label, prompt_template) = prompts[iteration % prompts.len()];
-        let prompt_text = build_prompt(checklist_path, prompt_template, &completion_token);
-
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let timestamp_msg = format!("\n[{}] Running {} prompt...", timestamp, label);
-        println!("{}", timestamp_msg);
-        if let Some(log) = logger.as_mut() {
-            let _ = log.logln(&timestamp_msg);
+    match run_config.mode {
+        RunMode::Worker => run_worker_loop(&run_config, &mut tool_chain, &mut logger)?,
+        RunMode::Controller => {
+            run_controller_worker_loop(&run_config, &mut tool_chain, &mut logger)?
         }
-        let _ = io::stdout().flush();
-
-        let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt_text, &mut logger)?;
-        stream_outputs(label, &stdout, &stderr, &mut logger);
-
-        if label == "controller" && completion_detected(&stdout, &completion_token) {
-            // Verify the completion token was intentionally emitted
-            if verify_completion_intent(&stdout, &completion_token, &mut tool_chain, &mut logger)? {
-                break;
-            }
-            // If not verified, continue the loop
-        }
-
-        iteration += 1;
-        let sleep_msg = format!("Sleeping {} seconds before next prompt...", sleep_seconds);
-        println!("{}", sleep_msg);
-        if let Some(log) = logger.as_mut() {
-            let _ = log.logln(&sleep_msg);
-        }
-        let _ = io::stdout().flush();
-        thread::sleep(Duration::from_secs(sleep_seconds));
     }
 
     Ok(())
@@ -810,10 +1336,7 @@ fn cmd_run(
 
 fn cmd_init(checklist: PathBuf, title: Option<String>, examples: bool) -> Result<()> {
     if checklist.exists() {
-        anyhow::bail!(
-            "Checklist file already exists: {}",
-            checklist.display()
-        );
+        anyhow::bail!("Checklist file already exists: {}", checklist.display());
     }
 
     if let Some(parent) = checklist.parent() {
@@ -823,8 +1346,9 @@ fn cmd_init(checklist: PathBuf, title: Option<String>, examples: bool) -> Result
     let title_text = title.unwrap_or_else(|| "Project Checklist".to_string());
 
     let mut content = format!("# {}\n\n", title_text);
-    content.push_str(STANDING_ORDERS);
-    content.push_str("\n\n");
+    let core_orders = render_core_standing_orders(DEFAULT_COMPLETION_TOKEN);
+    content.push_str(&core_orders);
+    content.push_str("\n\n# Project Standing Orders\n\n");
 
     if examples {
         content.push_str(
@@ -853,10 +1377,7 @@ Additional context or documentation goes here.
 
 fn cmd_generate(checklist: PathBuf, prompt: String, tools: String) -> Result<()> {
     if checklist.exists() {
-        anyhow::bail!(
-            "Checklist file already exists: {}",
-            checklist.display()
-        );
+        anyhow::bail!("Checklist file already exists: {}", checklist.display());
     }
 
     let generation_prompt = format!(
@@ -905,8 +1426,9 @@ Output ONLY the checklist content in Markdown format, nothing else.
         }
     }
 
-    full_content.push_str(STANDING_ORDERS);
-    full_content.push_str("\n\n");
+    let core_orders = render_core_standing_orders(DEFAULT_COMPLETION_TOKEN);
+    full_content.push_str(&core_orders);
+    full_content.push_str("\n\n# Project Standing Orders\n\n");
 
     // Add the rest of the generated content
     for line in &lines[content_start..] {
@@ -924,12 +1446,7 @@ Output ONLY the checklist content in Markdown format, nothing else.
     Ok(())
 }
 
-fn cmd_add(
-    checklist: PathBuf,
-    item: String,
-    sub: bool,
-    section: Option<String>,
-) -> Result<()> {
+fn cmd_add(checklist: PathBuf, item: String, sub: bool, section: Option<String>) -> Result<()> {
     if !checklist.exists() {
         anyhow::bail!("Checklist file does not exist: {}", checklist.display());
     }
@@ -1124,8 +1641,9 @@ Update the checklist according to the instruction above. Output the COMPLETE upd
         }
 
         // Add standing orders
-        new_content.push_str(STANDING_ORDERS);
-        new_content.push_str("\n\n");
+        let core_orders = render_core_standing_orders(DEFAULT_COMPLETION_TOKEN);
+        new_content.push_str(&core_orders);
+        new_content.push_str("\n\n# Project Standing Orders\n\n");
 
         // Add the LLM's content (skipping title if present)
         let llm_lines: Vec<&str> = updated_content.lines().collect();
@@ -1182,6 +1700,10 @@ fn main() -> Result<()> {
             worker_prompt,
             completion_token,
             sleep_seconds,
+            mode,
+            skip_audit,
+            audit_orders_path,
+            no_commit_audit,
             tools,
             log_file,
         } => {
@@ -1194,18 +1716,37 @@ fn main() -> Result<()> {
             let merged_worker_prompt = config.merge_with_cli(
                 worker_prompt.clone(),
                 config.worker_prompt.clone(),
-                DEFAULT_WORKER_PROMPT.to_string(),
+                prompts::DEFAULT_WORKER_PROMPT.to_string(),
             );
             let merged_completion_token = config.merge_with_cli(
                 completion_token.clone(),
                 config.completion_token.clone(),
                 DEFAULT_COMPLETION_TOKEN.to_string(),
             );
-            let merged_sleep_seconds = config.merge_with_cli(
-                sleep_seconds,
-                config.sleep_seconds,
-                15u64,
-            );
+            let merged_sleep_seconds =
+                config.merge_with_cli(sleep_seconds, config.sleep_seconds, 15u64);
+            let merged_skip_audit = config.merge_with_cli(skip_audit, config.skip_audit, false);
+            let merged_mode = if matches!(mode, RunMode::Worker) {
+                if let Some(mode_str) = &config.mode {
+                    mode_str.parse::<RunMode>().map_err(|err| anyhow!(err))?
+                } else {
+                    mode
+                }
+            } else {
+                mode
+            };
+            let merged_audit_orders_path = if let Some(path) = audit_orders_path.clone() {
+                Some(path)
+            } else if let Some(config_path) = &config.orders_path {
+                Some(PathBuf::from(config_path))
+            } else {
+                None
+            };
+            let merged_commit_audit = if no_commit_audit {
+                false
+            } else {
+                config.commit_audit.unwrap_or(true)
+            };
             let merged_tools = config.merge_with_cli(
                 tools.clone(),
                 config.tools.clone(),
@@ -1223,6 +1764,10 @@ fn main() -> Result<()> {
                 merged_worker_prompt,
                 merged_completion_token,
                 merged_sleep_seconds,
+                merged_mode,
+                merged_skip_audit,
+                merged_audit_orders_path,
+                merged_commit_audit,
                 merged_tools,
                 merged_log_file,
             )
