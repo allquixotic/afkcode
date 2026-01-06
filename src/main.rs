@@ -24,6 +24,7 @@ mod logger;
 mod parallel;
 mod prompts;
 mod runner;
+mod wakelock;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;

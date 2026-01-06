@@ -26,6 +26,7 @@ use crate::llm::{LlmToolChain, ModelConfig};
 use crate::logger::Logger;
 use crate::parallel::{self, ParallelConfig};
 use crate::runner::{run_controller_worker_loop, run_worker_loop, RunConfig};
+use crate::wakelock::WakeLock;
 
 pub fn cmd_run(
     checklist: PathBuf,
@@ -47,6 +48,20 @@ pub fn cmd_run(
     gimme_base_path: PathBuf,
     items_per_instance: usize,
 ) -> Result<()> {
+    // Acquire wake lock to prevent system sleep during LLM execution.
+    // Uses OS-native facilities that are automatically released when the process exits,
+    // even if forcibly killed (SIGKILL), so the system can still sleep afterward.
+    let _wake_guard = match WakeLock::try_acquire() {
+        Some(guard) => {
+            println!("System sleep inhibited while LLM subprocesses are running");
+            Some(guard)
+        }
+        None => {
+            eprintln!("Warning: Could not acquire wake lock. System may sleep during execution.");
+            None
+        }
+    };
+
     // Ensure checklist file exists
     if let Some(parent) = checklist.parent() {
         fs::create_dir_all(parent)?;

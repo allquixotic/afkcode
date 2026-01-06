@@ -18,6 +18,7 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 - **Completion Token Verification**: LLM confirms intentional completion to prevent accidental loop exits
 - **Output Logging**: Automatically streams all LLM output and console messages to a configurable log file during run mode
 - **Failed LLM Recovery**: Automatically restores work items if an LLM subprocess crashes or hits rate limits
+- **Sleep Prevention**: Prevents system sleep (S3) while LLM subprocesses are running - safe even if afkcode is forcibly killed
 
 ## Installation
 
@@ -725,6 +726,7 @@ claude --print --dangerously-skip-permissions
 - **Confirmation Prompts**: `remove` asks for confirmation (unless `--yes`)
 - **Rate Limit Detection**: Automatically stops on rate limit
 - **Ctrl+C Handling**: Graceful shutdown on interrupt
+- **Sleep Prevention**: System sleep is inhibited during LLM execution. Uses OS-native process-bound facilities that automatically release when afkcode exits (including crashes or SIGKILL), so your laptop won't stay awake indefinitely if something goes wrong
 
 ## Troubleshooting
 
@@ -829,6 +831,7 @@ cargo run -- --help
 - **Failed LLM Recovery**: Automatically restores work items to `[ ]` if an LLM subprocess crashes or hits rate limits, using unique checkout IDs (`[ip:XXXX]`)
 - **Coordinated Shutdown**: When any LLM confirms completion, all instances finish their current iteration and exit gracefully
 - **Independent Fallback Tracking**: Each parallel instance has its own LlmToolChain for separate rate limit tracking
+- **Sleep Prevention**: Prevents system from sleeping (S3) while LLM subprocesses are running - uses OS-native facilities (macOS IOPMAssertion, Windows SetThreadExecutionState, Linux D-Bus inhibitor) that auto-release on process exit, so your laptop won't stay hot in your bag even if afkcode crashes
 - **Warp Agent API Support**: HTTP-based access to multiple LLM models (Claude 4.5, GPT-5, Gemini 3 Pro, etc.) through Warp's unified API
 - **Multi-Model Selection via Warp**: Single API key provides access to Claude, OpenAI, Google, and z.ai models
 - **Gemini Support**: Gemini CLI is now the default first tool in the fallback chain
