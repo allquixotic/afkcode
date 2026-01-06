@@ -24,11 +24,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::checklist::scanner::has_incomplete_items;
 use crate::coordinator::{StopCoordinator, SubprocessResult};
 use crate::gimme::{self, ChecklistItem, CheckoutFilters, CheckoutRequest};
 use crate::llm::{LlmToolChain, ModelConfig};
 use crate::logger::Logger;
 use crate::runner::{self, RunConfig};
+use crate::verifier::{run_verifier, VerifierConfig, VerifierResult};
 
 /// Configuration for parallel LLM execution.
 #[derive(Debug, Clone)]
@@ -51,14 +53,124 @@ pub struct ParallelConfig {
     pub tools: String,
     /// Base log file path.
     pub log_file: String,
+    /// Enable verifier phase after workers complete.
+    pub verify_enabled: bool,
+    /// Path to custom verifier prompt file.
+    pub verifier_prompt: Option<PathBuf>,
+    /// Enable spiral mode (auto-restart workers if verifier finds work).
+    pub spiral_enabled: bool,
+    /// Maximum number of verify/work spirals.
+    pub max_spirals: usize,
 }
 
-/// Run multiple LLM instances in parallel.
+/// Run multiple LLM instances in parallel with optional verify/spiral loop.
 ///
 /// Launches instances with staggered warmup delays. Each instance has its
 /// own independent LlmToolChain for fallback tracking. If any instance
 /// confirms stop, all others finish their current iteration and exit.
+///
+/// If verify_enabled, runs a verification LLM after workers complete.
+/// If spiral_enabled, restarts workers when verifier finds new work.
 pub fn run_parallel(config: ParallelConfig) -> Result<()> {
+    let mut spiral_count = 0;
+
+    loop {
+        // Check for shutdown before starting spiral iteration
+        if config.run_config.shutdown_flag.load(Ordering::Relaxed) {
+            println!("Shutdown requested. Exiting spiral loop.");
+            break;
+        }
+
+        // Phase 1: Run workers until completion (scanner-based in multi-checklist mode)
+        if spiral_count > 0 {
+            println!("=== Spiral iteration {} ===", spiral_count);
+        }
+
+        // Check if there's any work to do before launching workers
+        if config.run_config.multi_checklist_mode {
+            if let Some(ref base_path) = config.run_config.gimme_base_path {
+                match has_incomplete_items(base_path) {
+                    Ok(false) => {
+                        println!("Scanner: No incomplete items found before worker phase.");
+                        // Skip worker phase, go directly to verifier (if enabled)
+                    }
+                    Ok(true) => {
+                        // Work exists, run workers
+                        run_workers_phase(&config)?;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Scanner error: {}. Running workers anyway.", e);
+                        run_workers_phase(&config)?;
+                    }
+                }
+            } else {
+                run_workers_phase(&config)?;
+            }
+        } else {
+            run_workers_phase(&config)?;
+        }
+
+        // Check for shutdown after workers
+        if config.run_config.shutdown_flag.load(Ordering::Relaxed) {
+            println!("Shutdown requested after worker phase. Exiting.");
+            break;
+        }
+
+        // Phase 2: Run verifier if enabled
+        if config.verify_enabled {
+            println!("=== Starting verification phase ===");
+
+            let verifier_config = VerifierConfig {
+                prompt_path: config.verifier_prompt.clone(),
+                checklist_dir: config.gimme_base_path.clone(),
+                completion_token: config.run_config.completion_token.clone(),
+            };
+
+            let mut tool_chain = LlmToolChain::with_models(&config.tools, &config.model_config)?;
+            let mut logger = Logger::new(&format!("{}.verifier", config.log_file)).ok();
+
+            match run_verifier(&verifier_config, &mut tool_chain, &mut logger) {
+                Ok(VerifierResult::FoundWork(n)) => {
+                    spiral_count += 1;
+                    println!("Verifier found {} new work items (spiral {})", n, spiral_count);
+
+                    if !config.spiral_enabled {
+                        println!("Spiral mode disabled. Exiting after verification.");
+                        break;
+                    }
+
+                    if spiral_count >= config.max_spirals {
+                        println!(
+                            "Reached maximum spirals ({}). Exiting.",
+                            config.max_spirals
+                        );
+                        break;
+                    }
+
+                    // Continue to next spiral iteration
+                    println!("Restarting workers for spiral iteration {}...", spiral_count + 1);
+                    continue;
+                }
+                Ok(VerifierResult::NoNewWork) => {
+                    println!("Verifier confirmed: no new work found. Project complete.");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Verifier error: {}. Exiting.", e);
+                    break;
+                }
+            }
+        } else {
+            // No verifier, just exit after workers complete
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the parallel workers phase.
+fn run_workers_phase(config: &ParallelConfig) -> Result<()> {
     let coordinator = Arc::new(StopCoordinator::new(config.num_instances));
     let mut handles: Vec<(usize, JoinHandle<Result<SubprocessResult>>)> = Vec::new();
 
@@ -101,7 +213,7 @@ pub fn run_parallel(config: ParallelConfig) -> Result<()> {
 
         // Checkout work items if gimme mode enabled
         let work_items = if config.gimme_enabled {
-            match checkout_work_items(&config, id) {
+            match checkout_work_items(config, id) {
                 Ok(items) => {
                     if !items.is_empty() {
                         println!(

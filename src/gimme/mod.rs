@@ -49,6 +49,8 @@ pub struct ChecklistItem {
 pub enum MarkerType {
     /// `[ ]` - Incomplete task
     Incomplete,
+    /// `[~]` - Partially complete task
+    Partial,
     /// `[x]` - Completed but unverified
     Unverified,
     /// `[V]` - Verified complete
@@ -66,12 +68,22 @@ impl MarkerType {
     pub fn from_marker(marker: &str) -> Self {
         match marker {
             "[ ]" => MarkerType::Incomplete,
+            "[~]" => MarkerType::Partial,
             "[x]" => MarkerType::Unverified,
             "[V]" => MarkerType::Verified,
             m if m.starts_with("[ip") => MarkerType::InProgress,
             m if m.starts_with("[BLOCKED") => MarkerType::Blocked,
             _ => MarkerType::Unknown,
         }
+    }
+
+    /// Returns true if this marker represents incomplete work.
+    /// Used by the scanner to detect when work remains.
+    pub fn is_incomplete(&self) -> bool {
+        matches!(
+            self,
+            MarkerType::Incomplete | MarkerType::Partial | MarkerType::InProgress
+        )
     }
 }
 
@@ -137,6 +149,7 @@ mod tests {
     #[test]
     fn test_marker_type_parsing() {
         assert_eq!(MarkerType::from_marker("[ ]"), MarkerType::Incomplete);
+        assert_eq!(MarkerType::from_marker("[~]"), MarkerType::Partial);
         assert_eq!(MarkerType::from_marker("[x]"), MarkerType::Unverified);
         assert_eq!(MarkerType::from_marker("[V]"), MarkerType::Verified);
         assert_eq!(MarkerType::from_marker("[ip]"), MarkerType::InProgress);
@@ -147,6 +160,17 @@ mod tests {
             MarkerType::Blocked
         );
         assert_eq!(MarkerType::from_marker("[?]"), MarkerType::Unknown);
+    }
+
+    #[test]
+    fn test_is_incomplete() {
+        assert!(MarkerType::Incomplete.is_incomplete());
+        assert!(MarkerType::Partial.is_incomplete());
+        assert!(MarkerType::InProgress.is_incomplete());
+        assert!(!MarkerType::Unverified.is_incomplete());
+        assert!(!MarkerType::Verified.is_incomplete());
+        assert!(!MarkerType::Blocked.is_incomplete());
+        assert!(!MarkerType::Unknown.is_incomplete());
     }
 
     #[test]

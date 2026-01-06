@@ -24,15 +24,20 @@ pub const CORE_STANDING_ORDERS_VERSION: &str = "1";
 
 pub const CORE_STANDING_ORDERS_TEMPLATE: &str = r#"# STANDING ORDERS - DO NOT DELETE
 
+> **CRITICAL**: `{completion_token}` means the ENTIRE PROJECT is finished. Do NOT emit this token after completing a single task. Only emit it after verifying the checklist contains ZERO `[ ]` or `[~]` items.
+
 1. Minimal Information: Checklist items contain only the minimum needed for an LLM to act.
 2. Completion Handling: Delete fully complete items. For partials, change `[ ]` to `[~]` and add sub-items for the remaining work.
 3. Discovery: Add newly discovered work as new (sub-)items, succinctly.
 4. Git Commit: Before finishing a work turn, run `git add` and `git commit` with a descriptive message summarizing changes.
 5. Immutability: The "STANDING ORDERS" section is immutable except during the one-time alignment step run by afkcode.
 6. No Manual Work: Do not require or mention manual human steps or manual testing; prefer automated tests and processes.
-7. "Do the thing": Review checklist, pick an important incomplete item, implement fully or partially, update checklist, build, fix errors, commit.
-8. "Fix shit": Identify broken code/design or incomplete implementations, fix, update checklist, commit.
-9. Stop Token Etiquette (Worker Mode): Emit `{completion_token}` on a line by itself at the very end ONLY when all requirements are met, no `[ ]` or `[~]` remain, the code builds cleanly, and all changes are committed.
+7. "Do the thing": Review checklist, pick an important incomplete item, implement fully or partially, update checklist, build, fix errors, commit. After committing, your turn ends normally—do NOT emit the completion token unless the checklist is now empty.
+8. "Fix shit": Identify broken code/design or incomplete implementations, fix, update checklist, commit. Do NOT emit the completion token unless the checklist is now empty.
+9. Stop Token Etiquette:
+   - **Single-checklist mode**: You may emit `{completion_token}` ONLY when ALL of these are true: (a) you have re-read the ENTIRE checklist, (b) there are ZERO `[ ]` items, (c) there are ZERO `[~]` items, (d) code builds cleanly, (e) all changes are committed.
+   - **Multi-checklist mode** (using `--checklist-dir`): NEVER emit the token. Completion is determined externally by the orchestrator scanning all AGENTS.md files.
+   - If unsure which mode you're in, do NOT emit the token. Completing one task does NOT mean emitting the token.
 "#;
 
 pub const WARP_AGENT_API_BASE: &str = "https://app.warp.dev/api/v1";

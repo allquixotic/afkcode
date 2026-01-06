@@ -53,8 +53,13 @@ impl std::str::FromStr for RunMode {
 pub enum Commands {
     /// Run the controller/worker loop against a checklist
     Run {
-        /// Path to the persistent checklist file
-        checklist: PathBuf,
+        /// Path to the persistent checklist file (single-file mode)
+        checklist: Option<PathBuf>,
+
+        /// Path to directory containing multiple AGENTS.md files (multi-checklist mode)
+        /// Mutually exclusive with positional checklist argument
+        #[arg(long, conflicts_with = "checklist")]
+        checklist_dir: Option<PathBuf>,
 
         /// Custom controller prompt template
         #[arg(long, default_value = DEFAULT_CONTROLLER_PROMPT)]
@@ -127,6 +132,22 @@ pub enum Commands {
         /// Number of work items per instance
         #[arg(long, default_value_t = 1)]
         items_per_instance: usize,
+
+        /// Enable verifier phase after workers complete (multi-checklist mode only)
+        #[arg(long)]
+        verify: bool,
+
+        /// Path to custom verifier prompt file
+        #[arg(long)]
+        verifier_prompt: Option<PathBuf>,
+
+        /// Auto-restart workers if verifier finds new work (enables spiral mode)
+        #[arg(long)]
+        spiral: bool,
+
+        /// Maximum number of verify/work spirals (default: 5)
+        #[arg(long, default_value_t = 5)]
+        max_spirals: usize,
     },
 
     /// Initialize a new bare checklist with standing orders

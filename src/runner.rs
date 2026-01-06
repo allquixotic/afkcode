@@ -22,6 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::audit::{run_standing_orders_audit, AuditConfig};
+use crate::checklist::scanner::has_incomplete_items;
 use crate::cli::RunMode;
 use crate::coordinator::{StopCoordinator, SubprocessResult};
 use crate::gimme::{self, ChecklistItem};
@@ -42,6 +43,10 @@ pub struct RunConfig {
     pub audit_orders_path: Option<PathBuf>,
     pub commit_audit: bool,
     pub shutdown_flag: Arc<AtomicBool>,
+    /// Multi-checklist mode: use scanner-based completion instead of token-based
+    pub multi_checklist_mode: bool,
+    /// Base path for scanning AGENTS.md files (used in multi_checklist_mode)
+    pub gimme_base_path: Option<PathBuf>,
 }
 
 struct WorkerLoopState {
@@ -59,19 +64,38 @@ pub fn fill_placeholders(template: &str, checklist: &str, completion_token: &str
         .to_string()
 }
 
+/// Build prompt with optional stop token injection.
+/// In multi_checklist_mode, stop token instructions are never injected since
+/// completion is determined by the scanner, not the LLM.
 pub fn build_prompt(checklist_path: &str, prompt_template: &str, completion_token: &str) -> String {
+    build_prompt_with_mode(checklist_path, prompt_template, completion_token, false)
+}
+
+/// Build prompt with explicit multi_checklist_mode flag.
+pub fn build_prompt_with_mode(
+    checklist_path: &str,
+    prompt_template: &str,
+    completion_token: &str,
+    multi_checklist_mode: bool,
+) -> String {
     let rendered_body = fill_placeholders(prompt_template, checklist_path, completion_token);
     let mut prompt = format!("@{}\n\n{}\n", checklist_path, rendered_body);
-    
+
+    // In multi_checklist_mode, never inject stop token instructions
+    // Completion is determined by scanning all AGENTS.md files, not by LLM judgment
+    if multi_checklist_mode {
+        return prompt;
+    }
+
     // Check if completion token is mentioned in the prompt or the checklist file
     let token_mentioned_in_prompt = prompt.to_lowercase().contains(&completion_token.to_lowercase());
-    
+
     let token_mentioned_in_checklist = if let Ok(checklist_content) = fs::read_to_string(checklist_path) {
         checklist_content.to_lowercase().contains(&completion_token.to_lowercase())
     } else {
         false
     };
-    
+
     // If the completion token is not mentioned anywhere, inject stop token instructions
     if !token_mentioned_in_prompt && !token_mentioned_in_checklist {
         prompt.push_str("\n---\n\n");
@@ -80,7 +104,7 @@ pub fn build_prompt(checklist_path: &str, prompt_template: &str, completion_toke
             completion_token
         ));
     }
-    
+
     prompt
 }
 
@@ -156,10 +180,11 @@ fn run_worker_turn(
     let status = format!("mode=worker iteration={} turn=normal", iteration);
     log_message(logger, &status);
 
-    let prompt = build_prompt(
+    let prompt = build_prompt_with_mode(
         &config.checklist_path_str,
         &config.worker_prompt,
         &config.completion_token,
+        config.multi_checklist_mode,
     );
     let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
     stream_outputs("worker", &stdout, &stderr, logger);
@@ -221,7 +246,32 @@ pub fn run_worker_loop(
             break;
         }
 
-        if state.saw_stop_token {
+        // In multi_checklist_mode, check scanner for completion instead of token-based
+        if config.multi_checklist_mode {
+            if let Some(ref base_path) = config.gimme_base_path {
+                match has_incomplete_items(base_path) {
+                    Ok(false) => {
+                        log_message(
+                            logger,
+                            "Scanner detected no incomplete items. All checklists complete.",
+                        );
+                        break;
+                    }
+                    Ok(true) => {
+                        // Work remains, continue
+                    }
+                    Err(e) => {
+                        log_warning(
+                            logger,
+                            &format!("Warning: Scanner error: {}. Continuing anyway.", e),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Token-based completion (only in single-checklist mode)
+        if !config.multi_checklist_mode && state.saw_stop_token {
             let confirmation_stdout = run_stop_confirmation_turn(
                 config,
                 tool_chain,
@@ -243,12 +293,16 @@ pub fn run_worker_loop(
         }
 
         let stdout = run_worker_turn(config, tool_chain, logger, state.iteration)?;
-        state.saw_stop_token = contains_token(&stdout, &config.completion_token);
+
+        // Only check for stop token in single-checklist mode
+        if !config.multi_checklist_mode {
+            state.saw_stop_token = contains_token(&stdout, &config.completion_token);
+        }
         state.last_stdout = stdout;
         state.iteration += 1;
 
         if config.shutdown_flag.load(Ordering::Relaxed) {
-             break;
+            break;
         }
 
         sleep_with_log(config.sleep_seconds, logger);

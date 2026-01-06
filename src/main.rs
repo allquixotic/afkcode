@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod audit;
+mod checklist;
 mod cli;
 mod commands;
 mod config;
@@ -24,6 +25,7 @@ mod logger;
 mod parallel;
 mod prompts;
 mod runner;
+mod verifier;
 mod wakelock;
 
 use anyhow::{anyhow, Context, Result};
@@ -76,6 +78,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run {
             checklist,
+            checklist_dir,
             controller_prompt,
             worker_prompt,
             completion_token,
@@ -94,7 +97,26 @@ fn main() -> Result<()> {
             no_gimme,
             gimme_path,
             items_per_instance,
+            verify,
+            verifier_prompt,
+            spiral,
+            max_spirals,
         } => {
+            // Validate that exactly one of checklist or checklist_dir is provided
+            let (checklist_path, multi_checklist_mode) = match (&checklist, &checklist_dir) {
+                (Some(path), None) => (path.clone(), false),
+                (None, Some(dir)) => {
+                    // In multi-checklist mode, we use the dir as gimme_path
+                    // and don't need a single checklist file
+                    (dir.join("AGENTS.md"), true) // Use root AGENTS.md as reference
+                }
+                (None, None) => {
+                    return Err(anyhow!("Either a checklist file or --checklist-dir must be provided"));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!("Cannot specify both checklist and --checklist-dir"));
+                }
+            };
             // Merge config with CLI args
             let merged_controller_prompt = config.merge_with_cli(
                 controller_prompt.clone(),
@@ -176,13 +198,18 @@ fn main() -> Result<()> {
             } else {
                 config.gimme_mode.unwrap_or(true)
             };
-            let merged_gimme_base_path = gimme_path.unwrap_or_else(|| {
-                config
-                    .gimme_base_path
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
+            // In multi-checklist mode, use checklist_dir as gimme base path
+            let merged_gimme_base_path = if multi_checklist_mode {
+                checklist_dir.clone().unwrap()
+            } else {
+                gimme_path.unwrap_or_else(|| {
+                    config
+                        .gimme_base_path
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."))
+                })
+            };
             let merged_items_per_instance =
                 config.merge_with_cli(items_per_instance, config.gimme_items_per_instance, 1usize);
 
@@ -199,8 +226,13 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Verify mode only makes sense in multi-checklist mode
+            if verify && !multi_checklist_mode {
+                eprintln!("Warning: --verify flag only works with --checklist-dir (multi-checklist mode)");
+            }
+
             cmd_run(
-                checklist,
+                checklist_path,
                 merged_controller_prompt,
                 merged_worker_prompt,
                 merged_completion_token,
@@ -218,6 +250,11 @@ fn main() -> Result<()> {
                 merged_gimme_enabled,
                 merged_gimme_base_path,
                 merged_items_per_instance,
+                multi_checklist_mode,
+                verify && multi_checklist_mode,
+                verifier_prompt,
+                spiral,
+                max_spirals,
             )
         }
         Commands::Init {

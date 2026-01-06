@@ -45,10 +45,16 @@ Additional context
 - `[ ]` - Incomplete task
 - `[x]` - Complete task (should be deleted per Standing Order #2)
 - `[~]` - Partially complete task (add sub-items for remaining work)
+- `[ip]` - In-progress task (claimed by a worker via gimme mode)
+- `[ip:XXXX]` - In-progress task with checkout ID (for tracking which worker claimed it)
+- `[V]` - Verified complete (used by verifier mode)
+- `[BLOCKED]` - Task is blocked awaiting resolution
 
 ## Standing Orders (Behavioral Invariants)
 
 These rules are **immutable** and govern all LLM behavior when working with checklists:
+
+> **CRITICAL**: `__ALL_TASKS_COMPLETE__` means the ENTIRE PROJECT is finished. Do NOT emit this token after completing a single task. Only emit it after verifying the checklist contains ZERO `[ ]` or `[~]` items.
 
 ### 1. Minimal Information
 Keep each checklist item to the minimum details an LLM needs to act. Avoid verbose descriptions.
@@ -104,6 +110,7 @@ When you receive the prompt "@{checklist} Do the thing.", execute this workflow:
    - Add newly discovered items
 5. **Compile**: Run build commands for affected projects, fix any errors
 6. **Commit**: Execute `git add` and `git commit` with descriptive message
+7. **End Turn**: Your turn is complete. Do NOT emit `__ALL_TASKS_COMPLETE__` unless you have verified the checklist now contains ZERO incomplete items.
 
 ### 8. "Fix shit" Command Semantics
 
@@ -117,13 +124,89 @@ When you receive this instruction, execute this workflow:
 2. **Fix**: Solve the identified problems
 3. **Update**: Modify checklist to reflect fixes
 4. **Commit**: Execute `git add` and `git commit`
+5. **End Turn**: Your turn is complete. Do NOT emit `__ALL_TASKS_COMPLETE__` unless the checklist is now empty.
 
 ### 9. Stop Token Etiquette (Worker Mode)
-Emit the completion token on a line by itself only when every requirement is satisfied, no `[ ]` or `[~]` items remain, the code builds cleanly, and all changes are committed.
+
+**DEFAULT: Do NOT emit `__ALL_TASKS_COMPLETE__`.** The vast majority of your turns will NOT end with this token.
+
+**Single-checklist mode**: You may emit the completion token ONLY when ALL of these conditions are true:
+- You have re-read the ENTIRE checklist file
+- There are ZERO `[ ]` items remaining
+- There are ZERO `[~]` items remaining
+- The code builds cleanly
+- All changes are committed
+
+**Multi-checklist mode** (using `--checklist-dir`): **NEVER emit the token.** Completion is determined externally by the orchestrator scanning all AGENTS.md files. Your job is to do work, not judge project-wide completion.
+
+**Completing your assigned task does NOT mean emitting the token.** Finishing one task simply means updating the checklist and committing—then your turn ends normally WITHOUT the token.
+
+If unsure which mode you're in, do NOT emit the token.
 
 > Checklist hygiene (short bullets, deleting completed items, using sub-items for partial work) is enforced by these Standing Orders; afkcode does not rewrite the checklist during worker turns.
 
 ## Invocation Modes
+
+### Multi-Checklist Mode
+
+When afkcode is run with `--checklist-dir <PATH>`, it enters multi-checklist mode which supports hierarchical project structures with multiple AGENTS.md files.
+
+**Structure Example**:
+```
+project/
+├── AGENTS.md              # Root architecture guide
+├── component-a/
+│   └── AGENTS.md          # Component A checklist
+├── component-b/
+│   └── AGENTS.md          # Component B checklist
+└── shared/
+    └── AGENTS.md          # Shared utilities checklist
+```
+
+**Key Differences from Single-Checklist Mode**:
+1. Workers **NEVER** emit the completion token (completion is determined by scanning all files)
+2. afkcode uses deterministic scanning to detect when all checklists have zero incomplete items
+3. Tasks are claimed across all AGENTS.md files using `[ip:XXXX]` checkout markers
+
+**Gimme Mode**: In multi-checklist mode, workers receive pre-assigned tasks with checkout IDs. The `[ip:XXXX]` marker prevents multiple workers from claiming the same task.
+
+### Verifier Mode
+
+When using multi-checklist mode with `--verify`, afkcode runs a verification phase after workers complete:
+
+```bash
+afkcode run --checklist-dir project/ --verify
+```
+
+The verifier LLM:
+1. Audits items marked `[x]` or `[V]` to verify actual completeness
+2. Compares implementations to reference sources for missing features
+3. Checks test coverage completeness
+4. Finds TODO/FIXME/stub implementations in code that aren't tracked in checklists
+
+If the verifier finds missing work, it adds new `[ ]` items to the appropriate AGENTS.md files.
+
+### Spiral Mode
+
+Spiral mode (`--spiral`) enables automatic restart of workers when the verifier finds new work:
+
+```bash
+afkcode run --checklist-dir project/ --verify --spiral --max-spirals 5
+```
+
+**Flow**:
+```
+Workers → Scan (complete?) → Verifier → Found work? → Workers → ...
+                    ↓                        ↓
+              No incomplete             No new work
+                    ↓                        ↓
+                 [EXIT]                   [EXIT]
+```
+
+The loop continues until:
+- No incomplete items are found (all `[ ]`, `[~]`, `[ip]` cleared)
+- Verifier finds no new work
+- Max spirals reached (default: 5)
 
 ### Controller Mode
 
@@ -166,7 +249,27 @@ otherwise, do not print that string.
 When invoked through specific afkcode commands, understand the context:
 
 ### `run` Command
+
+**Single-checklist mode** (default):
+```bash
+afkcode run CHECKLIST.md
+```
 Worker mode is the default: you receive the worker prompt repeatedly, with a one-time standing-orders alignment turn at the start (unless the user skips it). If `--mode controller` is supplied, controller and worker turns alternate as before. Maintain continuity across iterations by reading the updated checklist each time.
+
+**Multi-checklist mode**:
+```bash
+afkcode run --checklist-dir project/ [--verify] [--spiral] [--max-spirals 5]
+```
+Scans all AGENTS.md files under the given directory. Workers receive pre-assigned tasks and never emit the completion token. Completion is determined by the scanner finding zero incomplete items.
+
+**CLI Options**:
+- `--num-instances N`: Run N parallel worker instances (default: 1)
+- `--warmup-delay S`: Seconds between launching instances (default: 30)
+- `--verify`: Enable verifier phase after workers complete
+- `--verifier-prompt PATH`: Custom verifier prompt file
+- `--spiral`: Auto-restart workers if verifier finds work
+- `--max-spirals N`: Maximum spiral iterations (default: 5)
+- `--no-gimme`: Disable gimme mode (task checkout)
 
 ### `generate` Command
 You are being asked to create a complete project checklist from a high-level description. Output ONLY:
@@ -372,12 +475,29 @@ __ALL_TASKS_COMPLETE__
 
 ## Completion Detection
 
+Completion detection varies by mode:
+
+### Single-Checklist Mode (Token-Based)
 Worker mode and controller mode share the same completion token (default: `__ALL_TASKS_COMPLETE__`), but the exit rules differ:
 
-- **Worker mode**: You may emit the token on a line by itself only when every requirement is satisfied, no `[ ]` or `[~]` items remain, the code builds cleanly, and all changes are committed. afkcode treats the token as a stop request, then issues a confirmation prompt; the loop exits only if you emit the token again in that confirmation turn.
-- **Controller mode**: Only the controller can emit the completion token. afkcode sends a verification prompt to confirm intent before exiting, just as in previous releases.
+- **Worker mode**: **DEFAULT: Do NOT emit the token.** Most worker turns end without it. You may only emit the token when: (a) you've re-read the entire checklist, (b) there are ZERO `[ ]` items, (c) there are ZERO `[~]` items, (d) code builds cleanly, (e) all changes are committed. Completing one task does NOT mean emitting the token. afkcode treats the token as a stop request, then issues a confirmation prompt; the loop exits only if you emit the token again in that confirmation turn.
+- **Controller mode**: Only the controller can emit the completion token. afkcode sends a verification prompt to confirm intent before exiting.
 
 If anything remains incomplete or uncertain, do **not** emit the token.
+
+### Multi-Checklist Mode (Scanner-Based)
+Workers **NEVER** emit the completion token. Instead, afkcode uses deterministic scanning:
+
+1. After each worker iteration, scanner checks all AGENTS.md files
+2. Looks for incomplete markers: `[ ]`, `[~]`, `[ip]`, `[ip:XXXX]`
+3. If all checklists have zero incomplete items, workers phase ends
+4. If `--verify` is enabled, verifier runs to audit "complete" items
+5. If `--spiral` is enabled and verifier finds work, workers restart
+
+This approach ensures:
+- No single worker can prematurely declare project-wide completion
+- Completion is objective and deterministic
+- Verifier can catch items that were marked complete but aren't actually done
 
 ## Summary
 

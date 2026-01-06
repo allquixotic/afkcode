@@ -47,6 +47,11 @@ pub fn cmd_run(
     gimme_enabled: bool,
     gimme_base_path: PathBuf,
     items_per_instance: usize,
+    multi_checklist_mode: bool,
+    verify_enabled: bool,
+    verifier_prompt: Option<PathBuf>,
+    spiral_enabled: bool,
+    max_spirals: usize,
 ) -> Result<()> {
     // Acquire wake lock to prevent system sleep during LLM execution.
     // Uses OS-native facilities that are automatically released when the process exits,
@@ -105,10 +110,17 @@ pub fn cmd_run(
         audit_orders_path,
         commit_audit,
         shutdown_flag,
+        multi_checklist_mode,
+        gimme_base_path: if multi_checklist_mode {
+            Some(gimme_base_path.clone())
+        } else {
+            None
+        },
     };
 
-    // Use parallel runner if num_instances > 1
-    if num_instances > 1 {
+    // Use parallel runner if num_instances > 1 OR if verify is enabled
+    // (single-instance with verify still uses the parallel infrastructure for spiral loop)
+    if num_instances > 1 || verify_enabled {
         let parallel_config = ParallelConfig {
             num_instances,
             warmup_delay: Duration::from_secs(warmup_delay),
@@ -119,6 +131,10 @@ pub fn cmd_run(
             model_config,
             tools,
             log_file,
+            verify_enabled,
+            verifier_prompt,
+            spiral_enabled,
+            max_spirals,
         };
         return parallel::run_parallel(parallel_config);
     }

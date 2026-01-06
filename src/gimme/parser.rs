@@ -25,9 +25,9 @@ use walkdir::WalkDir;
 use super::ChecklistItem;
 
 /// Pattern matching checklist items.
-/// Matches: `- [ ] task`, `- [x] task`, `- [V] task`, `- [ip] task`, `- [ip:xxxx] task`, `- [BLOCKED] task`
+/// Matches: `- [ ] task`, `- [~] task`, `- [x] task`, `- [V] task`, `- [ip] task`, `- [ip:xxxx] task`, `- [BLOCKED] task`
 static CHECKLIST_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"^(\s*)-\s*\[([ xV]|ip(?::[a-f0-9]+)?|BLOCKED(?::[^\]]*)?)\]\s*(.*)$"#).unwrap()
+    Regex::new(r#"^(\s*)-\s*\[([ ~xV]|ip(?::[a-f0-9]+)?|BLOCKED(?::[^\]]*)?)\]\s*(.*)$"#).unwrap()
 });
 
 /// Pattern matching sub-items (indented lines starting with dash).
