@@ -17,8 +17,11 @@ mod cli;
 mod commands;
 mod config;
 mod constants;
+mod coordinator;
+mod gimme;
 mod llm;
 mod logger;
+mod parallel;
 mod prompts;
 mod runner;
 
@@ -85,6 +88,11 @@ fn main() -> Result<()> {
             gemini_model,
             claude_model,
             codex_model,
+            num_instances,
+            warmup_delay,
+            no_gimme,
+            gimme_path,
+            items_per_instance,
         } => {
             // Merge config with CLI args
             let merged_controller_prompt = config.merge_with_cli(
@@ -157,6 +165,26 @@ fn main() -> Result<()> {
                 warp_api_key,
             };
 
+            // Merge parallel/gimme settings
+            let merged_num_instances =
+                config.merge_with_cli(num_instances, config.num_instances, 1usize);
+            let merged_warmup_delay =
+                config.merge_with_cli(warmup_delay, config.warmup_delay, 30u64);
+            let merged_gimme_enabled = if no_gimme {
+                false
+            } else {
+                config.gimme_mode.unwrap_or(true)
+            };
+            let merged_gimme_base_path = gimme_path.unwrap_or_else(|| {
+                config
+                    .gimme_base_path
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let merged_items_per_instance =
+                config.merge_with_cli(items_per_instance, config.gimme_items_per_instance, 1usize);
+
             cmd_run(
                 checklist,
                 merged_controller_prompt,
@@ -171,6 +199,11 @@ fn main() -> Result<()> {
                 merged_log_file,
                 model_config,
                 shutdown_flag,
+                merged_num_instances,
+                merged_warmup_delay,
+                merged_gimme_enabled,
+                merged_gimme_base_path,
+                merged_items_per_instance,
             )
         }
         Commands::Init {

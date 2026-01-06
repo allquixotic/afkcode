@@ -23,10 +23,13 @@ use std::time::Duration;
 
 use crate::audit::{run_standing_orders_audit, AuditConfig};
 use crate::cli::RunMode;
+use crate::coordinator::{StopCoordinator, SubprocessResult};
+use crate::gimme::{self, ChecklistItem};
 use crate::llm::LlmToolChain;
 use crate::logger::Logger;
 use crate::prompts;
 
+#[derive(Clone, Debug)]
 pub struct RunConfig {
     pub checklist: PathBuf,
     pub checklist_path_str: String,
@@ -366,4 +369,183 @@ Text to analyze:
             Ok(false)
         }
     }
+}
+
+/// Run a worker loop for a parallel subprocess.
+///
+/// This is similar to `run_worker_loop` but integrates with the StopCoordinator
+/// for cross-thread coordination and supports gimme work items.
+pub fn run_worker_loop_parallel(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+    coordinator: &StopCoordinator,
+    subprocess_id: usize,
+    work_items: &[ChecklistItem],
+) -> Result<SubprocessResult> {
+    let mut state = WorkerLoopState {
+        iteration: 1,
+        last_stdout: String::new(),
+        saw_stop_token: false,
+        audit_done: config.skip_audit,
+    };
+
+    // Build effective prompt (with gimme items if present)
+    let effective_worker_prompt = if !work_items.is_empty() {
+        let gimme_section = gimme::checkout::build_work_items_prompt(work_items);
+        format!("{}\n\n{}", gimme_section, config.worker_prompt)
+    } else {
+        config.worker_prompt.clone()
+    };
+
+    // Create a modified config with the effective prompt
+    let effective_config = RunConfig {
+        worker_prompt: effective_worker_prompt,
+        ..config.clone()
+    };
+
+    // Skip audit for parallel runs (should be done by main process)
+    state.audit_done = true;
+
+    loop {
+        // Check coordinator stop flag before starting iteration
+        if coordinator.should_stop() {
+            log_message(
+                logger,
+                &format!("[Instance {}] Stop signal received, finishing.", subprocess_id),
+            );
+            return Ok(SubprocessResult::Shutdown);
+        }
+
+        // Check local shutdown flag (Ctrl+C)
+        if config.shutdown_flag.load(Ordering::Relaxed) {
+            log_message(
+                logger,
+                &format!("[Instance {}] Shutdown requested, finishing.", subprocess_id),
+            );
+            return Ok(SubprocessResult::Shutdown);
+        }
+
+        // Mark that we're starting an LLM call (not at a safe stopping point)
+        coordinator.mark_iteration_start(subprocess_id);
+
+        if state.saw_stop_token {
+            let confirmation_stdout = run_stop_confirmation_turn_parallel(
+                &effective_config,
+                tool_chain,
+                logger,
+                state.iteration,
+                &state.last_stdout,
+                subprocess_id,
+            )?;
+
+            // Mark iteration complete - we're at a safe stopping point
+            coordinator.mark_iteration_complete(subprocess_id);
+
+            let confirmed = contains_token(&confirmation_stdout, &config.completion_token);
+            if confirmed {
+                log_message(
+                    logger,
+                    &format!(
+                        "[Instance {}] Stop token confirmed; signaling coordinator.",
+                        subprocess_id
+                    ),
+                );
+                // Signal coordinator - this triggers global stop
+                coordinator.signal_stop(subprocess_id);
+                return Ok(SubprocessResult::StopConfirmed);
+            }
+
+            state.saw_stop_token = false;
+            state.last_stdout = confirmation_stdout;
+
+            // Check for stop before sleeping
+            if coordinator.should_stop() || config.shutdown_flag.load(Ordering::Relaxed) {
+                return Ok(SubprocessResult::Shutdown);
+            }
+
+            sleep_with_log(config.sleep_seconds, logger);
+            continue;
+        }
+
+        let stdout = run_worker_turn_parallel(
+            &effective_config,
+            tool_chain,
+            logger,
+            state.iteration,
+            subprocess_id,
+        )?;
+
+        // Mark iteration complete - we're at a safe stopping point
+        coordinator.mark_iteration_complete(subprocess_id);
+
+        state.saw_stop_token = contains_token(&stdout, &config.completion_token);
+        state.last_stdout = stdout;
+        state.iteration += 1;
+
+        // Check for stop before sleeping
+        if coordinator.should_stop() || config.shutdown_flag.load(Ordering::Relaxed) {
+            return Ok(SubprocessResult::Shutdown);
+        }
+
+        sleep_with_log(config.sleep_seconds, logger);
+    }
+}
+
+fn run_worker_turn_parallel(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+    iteration: usize,
+    subprocess_id: usize,
+) -> Result<String> {
+    let status = format!(
+        "mode=worker instance={} iteration={} turn=normal",
+        subprocess_id, iteration
+    );
+    log_message(logger, &status);
+
+    let prompt = build_prompt(
+        &config.checklist_path_str,
+        &config.worker_prompt,
+        &config.completion_token,
+    );
+    let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
+    stream_outputs(&format!("worker-{}", subprocess_id), &stdout, &stderr, logger);
+    Ok(stdout)
+}
+
+fn run_stop_confirmation_turn_parallel(
+    config: &RunConfig,
+    tool_chain: &mut LlmToolChain,
+    logger: &mut Option<Logger>,
+    iteration: usize,
+    previous_stdout: &str,
+    subprocess_id: usize,
+) -> Result<String> {
+    let status = format!(
+        "mode=worker instance={} iteration={} turn=confirmation",
+        subprocess_id, iteration
+    );
+    log_message(logger, &status);
+
+    let mut prompt = build_prompt(
+        &config.checklist_path_str,
+        prompts::STOP_CONFIRMATION_PROMPT,
+        &config.completion_token,
+    );
+    prompt.push_str("\nPrevious response:\n");
+    prompt.push_str(previous_stdout);
+    if !previous_stdout.ends_with('\n') {
+        prompt.push('\n');
+    }
+
+    let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
+    stream_outputs(
+        &format!("confirmation-{}", subprocess_id),
+        &stdout,
+        &stderr,
+        logger,
+    );
+    Ok(stdout)
 }

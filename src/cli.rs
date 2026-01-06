@@ -107,6 +107,26 @@ pub enum Commands {
         /// Model to use for Codex CLI (e.g., o3, o4-mini)
         #[arg(long)]
         codex_model: Option<String>,
+
+        /// Number of parallel LLM instances
+        #[arg(long, default_value_t = 1)]
+        num_instances: usize,
+
+        /// Warmup delay between instances in seconds (0 to disable)
+        #[arg(long, default_value_t = 30)]
+        warmup_delay: u64,
+
+        /// Disable gimme mode (work item checkout)
+        #[arg(long)]
+        no_gimme: bool,
+
+        /// Base path for AGENTS.md file search
+        #[arg(long)]
+        gimme_path: Option<PathBuf>,
+
+        /// Number of work items per instance
+        #[arg(long, default_value_t = 1)]
+        items_per_instance: usize,
     },
 
     /// Initialize a new bare checklist with standing orders

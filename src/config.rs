@@ -58,6 +58,21 @@ pub struct Config {
     /// Warp Agent API configuration
     pub warp_api_key: Option<String>,
     pub warp_model: Option<String>,
+
+    /// Number of parallel LLM instances (default: 1)
+    pub num_instances: Option<usize>,
+
+    /// Warmup delay between launching instances in seconds (default: 30, 0 disables)
+    pub warmup_delay: Option<u64>,
+
+    /// Enable gimme mode for work item checkout (default: true)
+    pub gimme_mode: Option<bool>,
+
+    /// Base path for AGENTS.md file search (default: current directory)
+    pub gimme_base_path: Option<String>,
+
+    /// Number of work items each instance should check out (default: 1)
+    pub gimme_items_per_instance: Option<usize>,
 }
 
 impl Config {

@@ -18,11 +18,13 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cli::RunMode;
 use crate::constants::{render_core_standing_orders, DEFAULT_COMPLETION_TOKEN};
 use crate::llm::{LlmToolChain, ModelConfig};
 use crate::logger::Logger;
+use crate::parallel::{self, ParallelConfig};
 use crate::runner::{run_controller_worker_loop, run_worker_loop, RunConfig};
 
 pub fn cmd_run(
@@ -39,6 +41,11 @@ pub fn cmd_run(
     log_file: String,
     model_config: ModelConfig,
     shutdown_flag: Arc<AtomicBool>,
+    num_instances: usize,
+    warmup_delay: u64,
+    gimme_enabled: bool,
+    gimme_base_path: PathBuf,
+    items_per_instance: usize,
 ) -> Result<()> {
     // Ensure checklist file exists
     if let Some(parent) = checklist.parent() {
@@ -85,6 +92,23 @@ pub fn cmd_run(
         shutdown_flag,
     };
 
+    // Use parallel runner if num_instances > 1
+    if num_instances > 1 {
+        let parallel_config = ParallelConfig {
+            num_instances,
+            warmup_delay: Duration::from_secs(warmup_delay),
+            gimme_enabled,
+            gimme_base_path,
+            items_per_instance,
+            run_config,
+            model_config,
+            tools,
+            log_file,
+        };
+        return parallel::run_parallel(parallel_config);
+    }
+
+    // Single instance mode (original behavior)
     let mut tool_chain = LlmToolChain::with_models(&tools, &model_config)?;
 
     match run_config.mode {

@@ -5,6 +5,8 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 ## Features
 
 - **Autonomous Development Loop**: Worker-only loop by default, with optional controller/worker alternation
+- **Parallel LLM Execution**: Run multiple LLM instances simultaneously with staggered warmup delays to maximize throughput
+- **Gimme Mode**: Automatic work item checkout from AGENTS.md files - LLMs get assigned specific tasks to prevent conflicts
 - **Checklist Generation**: Create checklists from high-level prompts using LLM
 - **Checklist Management**: Add, remove, and update checklist items with or without LLM assistance
 - **Standing Orders**: Built-in project invariants ensure consistent LLM behavior
@@ -15,6 +17,7 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 - **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted with temporary 5-minute squelching
 - **Completion Token Verification**: LLM confirms intentional completion to prevent accidental loop exits
 - **Output Logging**: Automatically streams all LLM output and console messages to a configurable log file during run mode
+- **Failed LLM Recovery**: Automatically restores work items if an LLM subprocess crashes or hits rate limits
 
 ## Installation
 
@@ -66,7 +69,14 @@ Options:
   --gemini-model <MODEL>             Model to use for Gemini CLI (e.g., gemini-2.5-pro)
   --claude-model <MODEL>             Model to use for Claude CLI (e.g., sonnet, opus)
   --codex-model <MODEL>              Model to use for Codex CLI (e.g., o3, o4-mini)
-  
+
+Parallel Execution Options:
+  --num-instances <N>                Number of parallel LLM instances (default: 1)
+  --warmup-delay <SECONDS>           Delay between launching instances (default: 30, 0 to disable)
+  --no-gimme                         Disable gimme mode (work item checkout)
+  --gimme-path <PATH>                Base path for AGENTS.md file search (default: current directory)
+  --items-per-instance <N>           Number of work items each instance checks out (default: 1)
+
 Warp Agent API requires WARP_API_KEY environment variable or warp_api_key in config.
 See "Warp Agent API" section below for details.
 ```
@@ -93,6 +103,15 @@ afkcode run project.md --run-audit --audit-orders-path docs/AGENTS.md
 
 # Custom sleep time with multiple tools
 afkcode run project.md --tools codex,claude --sleep-seconds 30
+
+# Run 3 parallel LLM instances with 30-second warmup delay between each
+afkcode run project.md --num-instances 3 --warmup-delay 30
+
+# Parallel execution with gimme mode (each instance gets its own work item)
+afkcode run project.md --num-instances 4 --items-per-instance 2
+
+# Disable gimme mode (all instances work on same checklist)
+afkcode run project.md --num-instances 2 --no-gimme
 ```
 
 **How Fallback Works:**
@@ -102,6 +121,38 @@ afkcode run project.md --tools codex,claude --sleep-seconds 30
 4. After 5 minutes, the system automatically tries the most preferred tool again
 5. Continues development loop seamlessly
 6. Only exits if all tools exhausted or completion detected
+
+**Parallel Execution:**
+
+Run multiple LLM instances simultaneously to maximize throughput:
+
+1. **Staggered Launch**: Instances launch with configurable warmup delay (default 30s) to prevent API rate limit spikes
+2. **Independent Fallback**: Each instance has its own LlmToolChain with separate rate limit tracking
+3. **Coordinated Shutdown**: When any instance confirms completion (stop token twice), all instances finish their current iteration and exit
+4. **Gimme Mode**: By default, each instance checks out work items from AGENTS.md files, preventing multiple LLMs from working on the same task
+
+**Gimme Mode (Work Item Checkout):**
+
+Gimme mode automatically assigns work items to each LLM instance:
+
+1. Parses all `AGENTS.md` files under the search path
+2. Selects items marked `[ ]` (incomplete) - configurable to include `[x]` or `[BLOCKED]`
+3. Marks selected items as `[ip:XXXX]` with unique checkout IDs
+4. Injects work items into each instance's prompt
+5. **Failed LLM Recovery**: If an LLM crashes or hits rate limits, its work items are automatically restored to `[ ]` using the checkout ID
+
+Example AGENTS.md workflow:
+```markdown
+# Before checkout
+- [ ] Implement user authentication
+- [ ] Add rate limiting
+- [ ] Write unit tests
+
+# After checkout (instance 0 gets first item)
+- [ip:a3f7] Implement user authentication
+- [ ] Add rate limiting
+- [ ] Write unit tests
+```
 
 **Completion Token Verification:**
 - **Worker mode**: The worker's stdout is scanned (case-insensitive) for the configured `completion_token`. If detected, afkcode runs a confirmation turn using a dedicated prompt. The loop exits only when the token appears again in that confirmation response; otherwise work resumes normally.
@@ -419,6 +470,13 @@ completion_token = "__ALL_TASKS_COMPLETE__"
 # gemini_model = "gemini-2.5-pro"
 # claude_model = "opus"
 # codex_model = "o3"
+
+# Parallel execution settings
+# num_instances = 3           # Number of parallel LLM instances
+# warmup_delay = 30           # Seconds between launching instances
+# gimme_mode = true           # Enable work item checkout (default: true)
+# gimme_base_path = "."       # Base path for AGENTS.md search
+# gimme_items_per_instance = 1  # Work items each instance checks out
 ```
 
 ### Configuration Examples
@@ -766,6 +824,11 @@ cargo run -- --help
 
 ### New Features (Latest)
 
+- **Parallel LLM Execution**: Run multiple LLM instances simultaneously with staggered warmup delays (`--num-instances`, `--warmup-delay`)
+- **Gimme Mode**: Automatic work item checkout from AGENTS.md files - each LLM instance gets assigned specific tasks to prevent conflicts
+- **Failed LLM Recovery**: Automatically restores work items to `[ ]` if an LLM subprocess crashes or hits rate limits, using unique checkout IDs (`[ip:XXXX]`)
+- **Coordinated Shutdown**: When any LLM confirms completion, all instances finish their current iteration and exit gracefully
+- **Independent Fallback Tracking**: Each parallel instance has its own LlmToolChain for separate rate limit tracking
 - **Warp Agent API Support**: HTTP-based access to multiple LLM models (Claude 4.5, GPT-5, Gemini 3 Pro, etc.) through Warp's unified API
 - **Multi-Model Selection via Warp**: Single API key provides access to Claude, OpenAI, Google, and z.ai models
 - **Gemini Support**: Gemini CLI is now the default first tool in the fallback chain
