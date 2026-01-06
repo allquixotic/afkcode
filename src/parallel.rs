@@ -57,6 +57,8 @@ pub struct ParallelConfig {
     pub verify_enabled: bool,
     /// Path to custom verifier prompt file.
     pub verifier_prompt: Option<PathBuf>,
+    /// Tools for verifier (if different from workers). Uses default models.
+    pub verifier_tools: Option<String>,
     /// Enable spiral mode (auto-restart workers if verifier finds work).
     pub spiral_enabled: bool,
     /// Maximum number of verify/work spirals.
@@ -126,7 +128,15 @@ pub fn run_parallel(config: ParallelConfig) -> Result<()> {
                 completion_token: config.run_config.completion_token.clone(),
             };
 
-            let mut tool_chain = LlmToolChain::with_models(&config.tools, &config.model_config)?;
+            // Use verifier_tools with default models if specified, otherwise use worker config
+            let mut tool_chain = if let Some(ref vtools) = config.verifier_tools {
+                // Verifier uses specified tools with DEFAULT models (no overrides)
+                let default_model_config = ModelConfig::default();
+                println!("Verifier using tools: {} (with default models)", vtools);
+                LlmToolChain::with_models(vtools, &default_model_config)?
+            } else {
+                LlmToolChain::with_models(&config.tools, &config.model_config)?
+            };
             let mut logger = Logger::new(&format!("{}.verifier", config.log_file)).ok();
 
             match run_verifier(&verifier_config, &mut tool_chain, &mut logger) {

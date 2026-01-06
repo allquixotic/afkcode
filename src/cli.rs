@@ -141,6 +141,10 @@ pub enum Commands {
         #[arg(long)]
         verifier_prompt: Option<PathBuf>,
 
+        /// Tools for verifier (defaults to --tools). Uses default models, ignoring --claude-model etc.
+        #[arg(long)]
+        verifier_tools: Option<String>,
+
         /// Auto-restart workers if verifier finds new work (enables spiral mode)
         #[arg(long)]
         spiral: bool,

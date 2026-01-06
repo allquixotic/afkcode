@@ -99,6 +99,7 @@ fn main() -> Result<()> {
             items_per_instance,
             verify,
             verifier_prompt,
+            verifier_tools,
             spiral,
             max_spirals,
         } => {
@@ -253,6 +254,7 @@ fn main() -> Result<()> {
                 multi_checklist_mode,
                 verify && multi_checklist_mode,
                 verifier_prompt,
+                verifier_tools,
                 spiral,
                 max_spirals,
             )

@@ -50,6 +50,7 @@ pub fn cmd_run(
     multi_checklist_mode: bool,
     verify_enabled: bool,
     verifier_prompt: Option<PathBuf>,
+    verifier_tools: Option<String>,
     spiral_enabled: bool,
     max_spirals: usize,
 ) -> Result<()> {
@@ -133,6 +134,7 @@ pub fn cmd_run(
             log_file,
             verify_enabled,
             verifier_prompt,
+            verifier_tools,
             spiral_enabled,
             max_spirals,
         };
