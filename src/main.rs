@@ -22,8 +22,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::NamedTempFile;
 
 const DEFAULT_COMPLETION_TOKEN: &str = "__ALL_TASKS_COMPLETE__";
@@ -74,7 +78,7 @@ Output ONLY the full updated file content (no prose).
 /// Configuration file structure
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Config {
-    /// LLM tools to use (comma-separated: codex, claude)
+    /// LLM tools to use (comma-separated: gemini, codex, claude)
     tools: Option<String>,
 
     /// Sleep duration between LLM calls (in seconds)
@@ -103,6 +107,11 @@ struct Config {
 
     /// Commit audit changes automatically
     commit_audit: Option<bool>,
+
+    /// Per-tool model specifications (e.g., gemini_model, claude_model, codex_model)
+    gemini_model: Option<String>,
+    claude_model: Option<String>,
+    codex_model: Option<String>,
 }
 
 impl Config {
@@ -139,55 +148,100 @@ impl Config {
     }
 }
 
-/// LLM tool configuration and invocation logic
-#[derive(Debug, Clone)]
-enum LlmTool {
+/// LLM tool kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmToolKind {
+    Gemini,
     Codex,
     Claude,
 }
 
+/// LLM tool configuration and invocation logic
+#[derive(Debug, Clone)]
+struct LlmTool {
+    kind: LlmToolKind,
+    model: Option<String>,
+}
+
 impl LlmTool {
     fn from_name(name: &str) -> Result<Self> {
-        match name.to_lowercase().as_str() {
-            "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::Claude),
-            _ => anyhow::bail!("Unsupported LLM tool: {}. Supported: codex, claude", name),
-        }
+        let kind = match name.to_lowercase().as_str() {
+            "gemini" => LlmToolKind::Gemini,
+            "codex" => LlmToolKind::Codex,
+            "claude" => LlmToolKind::Claude,
+            _ => anyhow::bail!("Unsupported LLM tool: {}. Supported: gemini, codex, claude", name),
+        };
+        Ok(Self { kind, model: None })
+    }
+
+    fn with_model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
+        match self.kind {
+            LlmToolKind::Gemini => "gemini",
+            LlmToolKind::Codex => "codex",
+            LlmToolKind::Claude => "claude",
         }
     }
 
     fn command(&self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
+        match self.kind {
+            LlmToolKind::Gemini => "gemini",
+            LlmToolKind::Codex => "codex",
+            LlmToolKind::Claude => "claude",
         }
     }
 
     fn args(&self) -> Vec<String> {
-        match self {
-            Self::Codex => vec!["exec".to_string()],
-            Self::Claude => vec![
+        let mut args = match self.kind {
+            LlmToolKind::Gemini => vec!["--yolo".to_string()],
+            LlmToolKind::Codex => vec!["exec".to_string()],
+            LlmToolKind::Claude => vec![
                 "--print".to_string(),
                 "--dangerously-skip-permissions".to_string(),
             ],
+        };
+
+        // Add model argument if specified
+        if let Some(ref model) = self.model {
+            match self.kind {
+                LlmToolKind::Gemini => {
+                    args.push("-m".to_string());
+                    args.push(model.clone());
+                }
+                LlmToolKind::Codex => {
+                    args.push("-m".to_string());
+                    args.push(model.clone());
+                }
+                LlmToolKind::Claude => {
+                    args.push("--model".to_string());
+                    args.push(model.clone());
+                }
+            }
         }
+
+        args
     }
 
     fn rate_limit_patterns(&self) -> Vec<&'static str> {
-        match self {
-            Self::Codex => vec![
+        match self.kind {
+            LlmToolKind::Gemini => vec![
+                "rate limit",
+                "quota exceeded",
+                "429",
+                "too many requests",
+                "resource exhausted",
+            ],
+            LlmToolKind::Codex => vec![
                 "rate limit reached",
                 "rate_limit_error",
                 "429",
                 "too many requests",
             ],
-            Self::Claude => vec![
+            LlmToolKind::Claude => vec![
                 "usage limit reached",
                 "rate limit reached",
                 "rate_limit_error",
@@ -205,22 +259,44 @@ impl LlmTool {
     }
 
     fn invoke(&self, prompt: &str) -> Result<(String, String)> {
-        let mut child = Command::new(self.command())
-            .args(self.args())
+        let mut cmd = Command::new(self.command());
+        cmd.args(self.args());
+
+        // Gemini takes the prompt as a positional argument, others use stdin
+        if self.kind == LlmToolKind::Gemini {
+            cmd.arg(prompt);
+        }
+
+        // Spawn in a new process group so it won't receive terminal SIGINT
+        // This allows graceful Ctrl+C handling - the parent catches SIGINT and
+        // waits for the child to complete instead of both being killed
+        #[cfg(unix)]
+        let child_result = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn {} process. Is {} CLI installed?",
-                    self.name(),
-                    self.name()
-                )
-            })?;
+            .process_group(0)
+            .spawn();
+        #[cfg(not(unix))]
+        let child_result = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes())?;
+        let mut child = child_result.with_context(|| {
+            format!(
+                "Failed to spawn {} process. Is {} CLI installed?",
+                self.name(),
+                self.name()
+            )
+        })?;
+
+        // For non-Gemini tools, write prompt to stdin
+        if self.kind != LlmToolKind::Gemini {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(prompt.as_bytes())?;
+            }
         }
 
         let output = child.wait_with_output()?;
@@ -232,32 +308,42 @@ impl LlmTool {
 
     /// Invoke the LLM with thinking disabled for simple verification tasks
     fn invoke_without_thinking(&self, prompt: &str) -> Result<(String, String)> {
-        match self {
-            Self::Claude => {
+        match self.kind {
+            LlmToolKind::Gemini => {
+                // Gemini doesn't have a thinking mode toggle, just invoke normally
+                self.invoke(prompt)
+            }
+            LlmToolKind::Claude => {
                 // For Claude Code, wrap the prompt with thinking_mode disabled
                 let wrapped_prompt =
                     format!("<thinking_mode>disabled</thinking_mode>\n\n{}", prompt);
                 self.invoke(&wrapped_prompt)
             }
-            Self::Codex => {
+            LlmToolKind::Codex => {
                 // For Codex CLI, use minimal reasoning effort
                 let mut args = self.args();
                 args.push("-c".to_string());
                 args.push("model_reasoning_effort=\"minimal\"".to_string());
 
-                let mut child = Command::new(self.command())
-                    .args(args)
+                let mut cmd = Command::new(self.command());
+                cmd.args(args)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .with_context(|| {
-                        format!(
-                            "Failed to spawn {} process. Is {} CLI installed?",
-                            self.name(),
-                            self.name()
-                        )
-                    })?;
+                    .stderr(Stdio::piped());
+
+                // Spawn in a new process group so it won't receive terminal SIGINT
+                #[cfg(unix)]
+                let child_result = cmd.process_group(0).spawn();
+                #[cfg(not(unix))]
+                let child_result = cmd.spawn();
+
+                let mut child = child_result.with_context(|| {
+                    format!(
+                        "Failed to spawn {} process. Is {} CLI installed?",
+                        self.name(),
+                        self.name()
+                    )
+                })?;
 
                 if let Some(mut stdin) = child.stdin.take() {
                     stdin.write_all(prompt.as_bytes())?;
@@ -273,6 +359,24 @@ impl LlmTool {
     }
 }
 
+/// Per-tool model configuration
+#[derive(Debug, Clone, Default)]
+struct ModelConfig {
+    gemini_model: Option<String>,
+    claude_model: Option<String>,
+    codex_model: Option<String>,
+}
+
+impl ModelConfig {
+    fn get_model_for_tool(&self, kind: LlmToolKind) -> Option<String> {
+        match kind {
+            LlmToolKind::Gemini => self.gemini_model.clone(),
+            LlmToolKind::Claude => self.claude_model.clone(),
+            LlmToolKind::Codex => self.codex_model.clone(),
+        }
+    }
+}
+
 /// Manages multiple LLM tools with automatic fallback
 struct LlmToolChain {
     tools: Vec<LlmTool>,
@@ -282,12 +386,21 @@ struct LlmToolChain {
 }
 
 impl LlmToolChain {
+    #[allow(dead_code)]
     fn new(tool_names: &str) -> Result<Self> {
+        Self::with_models(tool_names, &ModelConfig::default())
+    }
+
+    fn with_models(tool_names: &str, model_config: &ModelConfig) -> Result<Self> {
         let tools: Result<Vec<_>> = tool_names
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(LlmTool::from_name)
+            .map(|name| {
+                let tool = LlmTool::from_name(name)?;
+                let model = model_config.get_model_for_tool(tool.kind);
+                Ok(tool.with_model(model))
+            })
             .collect();
 
         let tools = tools?;
@@ -586,9 +699,9 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = RunMode::Worker)]
         mode: RunMode,
 
-        /// Skip the standing orders audit on startup
+        /// Run the standing orders audit on startup (disabled by default)
         #[arg(long)]
-        skip_audit: bool,
+        run_audit: bool,
 
         /// Override the target file used for the standing orders audit
         #[arg(long)]
@@ -598,13 +711,25 @@ enum Commands {
         #[arg(long, hide = true)]
         no_commit_audit: bool,
 
-        /// Comma-separated list of LLM tools to try (codex, claude)
-        #[arg(long, default_value = "codex,claude")]
+        /// Comma-separated list of LLM tools to try (gemini, codex, claude)
+        #[arg(long, default_value = "gemini,codex,claude")]
         tools: String,
 
         /// Log file path for streaming output
         #[arg(long, default_value = "afkcode.log")]
         log_file: String,
+
+        /// Model to use for Gemini CLI (e.g., gemini-2.5-pro)
+        #[arg(long)]
+        gemini_model: Option<String>,
+
+        /// Model to use for Claude CLI (e.g., sonnet, opus, claude-sonnet-4-5-20250929)
+        #[arg(long)]
+        claude_model: Option<String>,
+
+        /// Model to use for Codex CLI (e.g., o3, o4-mini)
+        #[arg(long)]
+        codex_model: Option<String>,
     },
 
     /// Initialize a new bare checklist with standing orders
@@ -630,8 +755,20 @@ enum Commands {
         prompt: String,
 
         /// Comma-separated list of LLM tools to try
-        #[arg(long, default_value = "codex,claude")]
+        #[arg(long, default_value = "gemini,gemini,codex,claude")]
         tools: String,
+
+        /// Model to use for Gemini CLI
+        #[arg(long)]
+        gemini_model: Option<String>,
+
+        /// Model to use for Claude CLI
+        #[arg(long)]
+        claude_model: Option<String>,
+
+        /// Model to use for Codex CLI
+        #[arg(long)]
+        codex_model: Option<String>,
     },
 
     /// Add a single item to the checklist
@@ -660,8 +797,20 @@ enum Commands {
         description: String,
 
         /// Comma-separated list of LLM tools to try
-        #[arg(long, default_value = "codex,claude")]
+        #[arg(long, default_value = "gemini,codex,claude")]
         tools: String,
+
+        /// Model to use for Gemini CLI
+        #[arg(long)]
+        gemini_model: Option<String>,
+
+        /// Model to use for Claude CLI
+        #[arg(long)]
+        claude_model: Option<String>,
+
+        /// Model to use for Codex CLI
+        #[arg(long)]
+        codex_model: Option<String>,
     },
 
     /// Remove items from the checklist
@@ -686,8 +835,20 @@ enum Commands {
         instruction: String,
 
         /// Comma-separated list of LLM tools to try
-        #[arg(long, default_value = "codex,claude")]
+        #[arg(long, default_value = "gemini,codex,claude")]
         tools: String,
+
+        /// Model to use for Gemini CLI
+        #[arg(long)]
+        gemini_model: Option<String>,
+
+        /// Model to use for Claude CLI
+        #[arg(long)]
+        claude_model: Option<String>,
+
+        /// Model to use for Codex CLI
+        #[arg(long)]
+        codex_model: Option<String>,
     },
 }
 
@@ -702,6 +863,7 @@ struct RunConfig {
     skip_audit: bool,
     audit_orders_path: Option<PathBuf>,
     commit_audit: bool,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 struct WorkerLoopState {
@@ -868,6 +1030,11 @@ fn run_worker_loop(
     }
 
     loop {
+        if config.shutdown_flag.load(Ordering::Relaxed) {
+            log_message(logger, "Shutdown requested. Exiting loop.");
+            break;
+        }
+
         if state.saw_stop_token {
             let confirmation_stdout = run_stop_confirmation_turn(
                 config,
@@ -893,6 +1060,11 @@ fn run_worker_loop(
         state.saw_stop_token = contains_token(&stdout, &config.completion_token);
         state.last_stdout = stdout;
         state.iteration += 1;
+
+        if config.shutdown_flag.load(Ordering::Relaxed) {
+             break;
+        }
+
         sleep_with_log(config.sleep_seconds, logger);
     }
 
@@ -914,6 +1086,11 @@ fn run_controller_worker_loop(
     let mut iteration = 0;
 
     loop {
+        if config.shutdown_flag.load(Ordering::Relaxed) {
+            log_message(logger, "Shutdown requested. Exiting loop.");
+            break;
+        }
+
         let (label, prompt_template) = prompts[iteration % prompts.len()];
         let prompt = build_prompt(
             &config.checklist_path_str,
@@ -935,6 +1112,11 @@ fn run_controller_worker_loop(
         }
 
         iteration += 1;
+
+        if config.shutdown_flag.load(Ordering::Relaxed) {
+             break;
+        }
+
         sleep_with_log(config.sleep_seconds, logger);
     }
 
@@ -1277,6 +1459,8 @@ fn cmd_run(
     commit_audit: bool,
     tools: String,
     log_file: String,
+    model_config: ModelConfig,
+    shutdown_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     // Ensure checklist file exists
     if let Some(parent) = checklist.parent() {
@@ -1320,9 +1504,10 @@ fn cmd_run(
         skip_audit,
         audit_orders_path,
         commit_audit,
+        shutdown_flag,
     };
 
-    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let mut tool_chain = LlmToolChain::with_models(&tools, &model_config)?;
 
     match run_config.mode {
         RunMode::Worker => run_worker_loop(&run_config, &mut tool_chain, &mut logger)?,
@@ -1375,7 +1560,7 @@ Additional context or documentation goes here.
     Ok(())
 }
 
-fn cmd_generate(checklist: PathBuf, prompt: String, tools: String) -> Result<()> {
+fn cmd_generate(checklist: PathBuf, prompt: String, tools: String, model_config: ModelConfig) -> Result<()> {
     if checklist.exists() {
         anyhow::bail!("Checklist file already exists: {}", checklist.display());
     }
@@ -1401,7 +1586,7 @@ Output ONLY the checklist content in Markdown format, nothing else.
     );
 
     println!("Generating checklist...");
-    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let mut tool_chain = LlmToolChain::with_models(&tools, &model_config)?;
     let mut logger = None;
     let (stdout, _stderr) = tool_chain.invoke_with_fallback(&generation_prompt, &mut logger)?;
 
@@ -1493,7 +1678,7 @@ fn cmd_add(checklist: PathBuf, item: String, sub: bool, section: Option<String>)
     Ok(())
 }
 
-fn cmd_add_batch(checklist: PathBuf, description: String, tools: String) -> Result<()> {
+fn cmd_add_batch(checklist: PathBuf, description: String, tools: String, model_config: ModelConfig) -> Result<()> {
     if !checklist.exists() {
         anyhow::bail!("Checklist file does not exist: {}", checklist.display());
     }
@@ -1520,7 +1705,7 @@ Do not include explanations, headers, or any other text. Just the checkbox items
     );
 
     println!("Generating items...");
-    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let mut tool_chain = LlmToolChain::with_models(&tools, &model_config)?;
     let mut logger = None;
     let (stdout, _stderr) = tool_chain.invoke_with_fallback(&batch_prompt, &mut logger)?;
 
@@ -1596,7 +1781,7 @@ fn cmd_remove(checklist: PathBuf, pattern: String, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_update(checklist: PathBuf, instruction: String, tools: String) -> Result<()> {
+fn cmd_update(checklist: PathBuf, instruction: String, tools: String, model_config: ModelConfig) -> Result<()> {
     if !checklist.exists() {
         anyhow::bail!("Checklist file does not exist: {}", checklist.display());
     }
@@ -1618,7 +1803,7 @@ Update the checklist according to the instruction above. Output the COMPLETE upd
     );
 
     println!("Updating checklist...");
-    let mut tool_chain = LlmToolChain::new(&tools)?;
+    let mut tool_chain = LlmToolChain::with_models(&tools, &model_config)?;
     let mut logger = None;
     let (stdout, _stderr) = tool_chain.invoke_with_fallback(&update_prompt, &mut logger)?;
 
@@ -1677,10 +1862,27 @@ Update the checklist according to the instruction above. Output the COMPLETE upd
 }
 
 fn main() -> Result<()> {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let last_sigint = Arc::new(Mutex::new(None::<Instant>));
+
+    let shutdown_flag_clone = shutdown_flag.clone();
+    let last_sigint_clone = last_sigint.clone();
+
     // Handle Ctrl+C gracefully
-    ctrlc::set_handler(|| {
-        println!("\nInterrupted. Exiting.");
-        std::process::exit(0);
+    ctrlc::set_handler(move || {
+        let now = Instant::now();
+        let mut last = last_sigint_clone.lock().unwrap();
+        
+        if let Some(t) = *last {
+            if now.duration_since(t) < Duration::from_secs(5) {
+                println!("\nInterrupted again. Force exiting.");
+                std::process::exit(0);
+            }
+        }
+        
+        *last = Some(now);
+        shutdown_flag_clone.store(true, Ordering::SeqCst);
+        println!("\nInterrupted. Finishing current turn... (Press Ctrl+C again within 5s to force exit)");
     })
     .context("Error setting Ctrl-C handler")?;
 
@@ -1701,11 +1903,14 @@ fn main() -> Result<()> {
             completion_token,
             sleep_seconds,
             mode,
-            skip_audit,
+            run_audit,
             audit_orders_path,
             no_commit_audit,
             tools,
             log_file,
+            gemini_model,
+            claude_model,
+            codex_model,
         } => {
             // Merge config with CLI args
             let merged_controller_prompt = config.merge_with_cli(
@@ -1725,7 +1930,14 @@ fn main() -> Result<()> {
             );
             let merged_sleep_seconds =
                 config.merge_with_cli(sleep_seconds, config.sleep_seconds, 15u64);
-            let merged_skip_audit = config.merge_with_cli(skip_audit, config.skip_audit, false);
+            // Audit is skipped by default unless --run-audit is passed or config says to run it
+            let merged_skip_audit = if run_audit {
+                false // --run-audit was passed, so don't skip
+            } else if let Some(skip) = config.skip_audit {
+                skip // Use config value
+            } else {
+                true // Default: skip audit
+            };
             let merged_mode = if matches!(mode, RunMode::Worker) {
                 if let Some(mode_str) = &config.mode {
                     mode_str.parse::<RunMode>().map_err(|err| anyhow!(err))?
@@ -1750,13 +1962,20 @@ fn main() -> Result<()> {
             let merged_tools = config.merge_with_cli(
                 tools.clone(),
                 config.tools.clone(),
-                "codex,claude".to_string(),
+                "gemini,codex,claude".to_string(),
             );
             let merged_log_file = config.merge_with_cli(
                 log_file.clone(),
                 config.log_file.clone(),
                 "afkcode.log".to_string(),
             );
+
+            // Merge model configurations (CLI takes precedence over config file)
+            let model_config = ModelConfig {
+                gemini_model: gemini_model.or(config.gemini_model.clone()),
+                claude_model: claude_model.or(config.claude_model.clone()),
+                codex_model: codex_model.or(config.codex_model.clone()),
+            };
 
             cmd_run(
                 checklist,
@@ -1770,6 +1989,8 @@ fn main() -> Result<()> {
                 merged_commit_audit,
                 merged_tools,
                 merged_log_file,
+                model_config,
+                shutdown_flag,
             )
         }
         Commands::Init {
@@ -1781,13 +2002,21 @@ fn main() -> Result<()> {
             checklist,
             prompt,
             tools,
+            gemini_model,
+            claude_model,
+            codex_model,
         } => {
             let merged_tools = config.merge_with_cli(
                 tools.clone(),
                 config.tools.clone(),
-                "codex,claude".to_string(),
+                "gemini,codex,claude".to_string(),
             );
-            cmd_generate(checklist, prompt, merged_tools)
+            let model_config = ModelConfig {
+                gemini_model: gemini_model.or(config.gemini_model.clone()),
+                claude_model: claude_model.or(config.claude_model.clone()),
+                codex_model: codex_model.or(config.codex_model.clone()),
+            };
+            cmd_generate(checklist, prompt, merged_tools, model_config)
         }
         Commands::Add {
             checklist,
@@ -1799,13 +2028,21 @@ fn main() -> Result<()> {
             checklist,
             description,
             tools,
+            gemini_model,
+            claude_model,
+            codex_model,
         } => {
             let merged_tools = config.merge_with_cli(
                 tools.clone(),
                 config.tools.clone(),
-                "codex,claude".to_string(),
+                "gemini,codex,claude".to_string(),
             );
-            cmd_add_batch(checklist, description, merged_tools)
+            let model_config = ModelConfig {
+                gemini_model: gemini_model.or(config.gemini_model.clone()),
+                claude_model: claude_model.or(config.claude_model.clone()),
+                codex_model: codex_model.or(config.codex_model.clone()),
+            };
+            cmd_add_batch(checklist, description, merged_tools, model_config)
         }
         Commands::Remove {
             checklist,
@@ -1816,13 +2053,21 @@ fn main() -> Result<()> {
             checklist,
             instruction,
             tools,
+            gemini_model,
+            claude_model,
+            codex_model,
         } => {
             let merged_tools = config.merge_with_cli(
                 tools.clone(),
                 config.tools.clone(),
-                "codex,claude".to_string(),
+                "gemini,codex,claude".to_string(),
             );
-            cmd_update(checklist, instruction, merged_tools)
+            let model_config = ModelConfig {
+                gemini_model: gemini_model.or(config.gemini_model.clone()),
+                claude_model: claude_model.or(config.claude_model.clone()),
+                codex_model: codex_model.or(config.codex_model.clone()),
+            };
+            cmd_update(checklist, instruction, merged_tools, model_config)
         }
     }
 }
