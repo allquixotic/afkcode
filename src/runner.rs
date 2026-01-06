@@ -533,7 +533,9 @@ pub fn run_worker_loop_parallel(
         // Mark iteration complete - we're at a safe stopping point
         coordinator.mark_iteration_complete(subprocess_id);
 
-        state.saw_stop_token = contains_token(&stdout, &config.completion_token);
+        // In multi_checklist_mode, ignore stop token - completion is scanner-based
+        state.saw_stop_token = !config.multi_checklist_mode
+            && contains_token(&stdout, &config.completion_token);
         state.last_stdout = stdout;
         state.iteration += 1;
 
@@ -559,10 +561,11 @@ fn run_worker_turn_parallel(
     );
     log_message(logger, &status);
 
-    let prompt = build_prompt(
+    let prompt = build_prompt_with_mode(
         &config.checklist_path_str,
         &config.worker_prompt,
         &config.completion_token,
+        config.multi_checklist_mode,
     );
     let (stdout, stderr) = tool_chain.invoke_with_fallback(&prompt, logger)?;
     stream_outputs(&format!("worker-{}", subprocess_id), &stdout, &stderr, logger);
