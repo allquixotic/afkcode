@@ -9,7 +9,9 @@ A Rust port and enhancement of `codex_loop.py` that provides a Swiss Army knife 
 - **Checklist Management**: Add, remove, and update checklist items with or without LLM assistance
 - **Standing Orders**: Built-in project invariants ensure consistent LLM behavior
 - **Standing Orders Audit**: One-time alignment keeps in-repo Standing Orders synced with the core rules
-- **Multi-LLM Support**: Automatic fallback between Codex CLI and Claude Code on rate limits
+- **Multi-LLM Support**: Automatic fallback between Gemini, Codex CLI, Claude Code, and Warp Agent API on rate limits
+- **Model Selection**: Specify custom models for each LLM tool (e.g., gemini-2.5-pro, o3, opus)
+- **Custom AGENTS.md**: Separate file for LLM instructions and Standing Orders (see AGENTS_GUIDE.md)
 - **Smart Rate Limit Handling**: Automatically switches to backup LLM tool when quota exhausted with temporary 5-minute squelching
 - **Completion Token Verification**: LLM confirms intentional completion to prevent accidental loop exits
 - **Output Logging**: Automatically streams all LLM output and console messages to a configurable log file during run mode
@@ -57,36 +59,45 @@ Options:
   --completion-token <TOKEN>         Completion detection string
   --sleep-seconds <N>                Delay between iterations (default: 15)
   --mode <worker|controller>         Loop mode (default: worker)
-  --skip-audit                       Skip the Standing Orders alignment audit
-  --audit-orders-path <PATH>         Override the Standing Orders audit target file
-  --tools <TOOLS>                    Comma-separated list of LLM tools (default: codex,claude)
+  --run-audit                        Run the Standing Orders alignment audit (disabled by default)
+  --audit-orders-path <PATH>         Override the Standing Orders audit target file (see AGENTS_GUIDE.md)
+  --tools <TOOLS>                    Comma-separated list of LLM tools (default: gemini,codex,claude)
   --log-file <PATH>                  Log file path for streaming output (default: afkcode.log)
+  --gemini-model <MODEL>             Model to use for Gemini CLI (e.g., gemini-2.5-pro)
+  --claude-model <MODEL>             Model to use for Claude CLI (e.g., sonnet, opus)
+  --codex-model <MODEL>              Model to use for Codex CLI (e.g., o3, o4-mini)
+  
+Warp Agent API requires WARP_API_KEY environment variable or warp_api_key in config.
+See "Warp Agent API" section below for details.
 ```
 
 **Examples:**
 ```bash
-# With default fallback (Codex → Claude)
+# With default fallback (Gemini → Codex → Claude)
 afkcode run project.md
 
-# Claude only (no fallback)
-afkcode run project.md --tools claude
+# Specific tool with custom model
+afkcode run project.md --tools gemini --gemini-model gemini-2.5-pro
 
-# Codex only (no fallback)
-afkcode run project.md --tools codex
+# Claude with opus model
+afkcode run project.md --tools claude --claude-model opus
 
 # Controller/worker alternation
 afkcode run project.md --mode controller
 
-# Skip the Standing Orders audit (not recommended)
-afkcode run project.md --skip-audit
+# Run the Standing Orders audit (see AGENTS_GUIDE.md)
+afkcode run project.md --run-audit
 
-# Custom sleep time with fallback
+# Use custom AGENTS.md location
+afkcode run project.md --run-audit --audit-orders-path docs/AGENTS.md
+
+# Custom sleep time with multiple tools
 afkcode run project.md --tools codex,claude --sleep-seconds 30
 ```
 
 **How Fallback Works:**
-1. Starts with first tool in list (e.g., `codex`)
-2. If rate limit detected, automatically switches to next tool (`claude`)
+1. Starts with first tool in list (default: `gemini`)
+2. If rate limit detected, automatically switches to next tool (e.g., `codex`, then `claude`)
 3. Rate-limited tools are temporarily squelched for 5 minutes
 4. After 5 minutes, the system automatically tries the most preferred tool again
 5. Continues development loop seamlessly
@@ -132,7 +143,10 @@ Uses LLM to generate a complete checklist from a high-level description.
 afkcode generate <checklist> <prompt> [OPTIONS]
 
 Options:
-  --tools <TOOLS>        Comma-separated list of LLM tools (default: codex,claude)
+  --tools <TOOLS>        Comma-separated list of LLM tools (default: gemini,codex,claude)
+  --gemini-model <MODEL> Model to use for Gemini CLI (e.g., gemini-2.5-pro)
+  --claude-model <MODEL> Model to use for Claude CLI (e.g., sonnet, opus)
+  --codex-model <MODEL>  Model to use for Codex CLI (e.g., o3, o4-mini)
   
 ```
 
@@ -174,8 +188,10 @@ Uses LLM to expand a high-level description into multiple checklist items.
 afkcode add-batch <checklist> <description> [OPTIONS]
 
 Options:
-  --tools <TOOLS>        Comma-separated list of LLM tools (default: codex,claude)
-  
+  --tools <TOOLS>        Comma-separated list of LLM tools (default: gemini,codex,claude)
+  --gemini-model <MODEL> Model to use for Gemini CLI
+  --claude-model <MODEL> Model to use for Claude CLI
+  --codex-model <MODEL>  Model to use for Codex CLI
 ```
 
 **Example:**
@@ -212,8 +228,10 @@ Uses LLM to update the checklist according to instructions.
 afkcode update <checklist> <instruction> [OPTIONS]
 
 Options:
-  --tools <TOOLS>        Comma-separated list of LLM tools (default: codex,claude)
-  
+  --tools <TOOLS>        Comma-separated list of LLM tools (default: gemini,codex,claude)
+  --gemini-model <MODEL> Model to use for Gemini CLI
+  --claude-model <MODEL> Model to use for Claude CLI
+  --codex-model <MODEL>  Model to use for Codex CLI
 ```
 
 **Example:**
@@ -224,20 +242,44 @@ afkcode update project.md \
 
 **Note:** Creates a `.md.bak` backup before updating.
 
-## Standing Orders
+## Standing Orders and Custom AGENTS.md
 
-All generated and initialized checklists include these standing orders (invariants):
+Afkcode uses **Standing Orders** - a set of 9 immutable rules that govern LLM behavior during autonomous development. These ensure consistent, predictable behavior across sessions.
 
-1. All additions must be minimal information for LLM understanding
-2. Complete items are removed; partial items get `~` checkbox with sub-items
-3. New items discovered during work are added succinctly
-4. Git commits are made before finishing work
-5. Standing orders cannot be altered or deleted
-6. No manual human effort or testing references allowed
-7. "Do the thing" command: review, pick task, implement, update, compile, commit
-8. "Fix shit" command: identify broken code/design, fix, update, commit
+### Core Standing Orders Summary
 
-These invariants ensure consistent LLM behavior across autonomous development sessions.
+1. **Minimal Information**: Checklist items contain only the minimum needed for LLM action
+2. **Completion Handling**: Delete complete items; use `[~]` with sub-items for partials
+3. **Discovery**: Add newly discovered work succinctly
+4. **Git Commit**: Always commit before finishing a turn
+5. **Immutability**: Standing Orders can't be altered except during audit
+6. **No Manual Work**: Prefer automation over manual steps
+7. **"Do the thing"**: Review, pick, implement, update, build, commit
+8. **"Fix shit"**: Identify and fix broken code/design, update, commit
+9. **Stop Token Etiquette**: Only emit completion token when truly done
+
+### Custom AGENTS.md
+
+You can store Standing Orders and other LLM instructions in a separate `AGENTS.md` file. This provides:
+
+- **Cleaner checklists**: Separate task lists from meta-instructions
+- **Reusability**: Share one AGENTS.md across multiple checklists
+- **Better version control**: Track behavioral changes separately
+- **Warp integration**: Reference via `@AGENTS.md` in Warp's Agent Mode
+
+**Quick Start with AGENTS.md:**
+
+```bash
+# Create AGENTS.md
+touch AGENTS.md
+
+# Populate it with Standing Orders
+afkcode run project.md --run-audit
+
+# Now AGENTS.md contains core orders + space for project-specific rules
+```
+
+**For complete documentation on Standing Orders, audit process, and AGENTS.md usage, see [`AGENTS_GUIDE.md`](AGENTS_GUIDE.md).**
 
 ## Workflow Examples
 
@@ -335,9 +377,9 @@ afkcode --config /path/to/custom.toml run checklist.md
 Create an `afkcode.toml` file in your project directory. See `afkcode.toml.example` for a complete example with all available options.
 
 ```toml
-# LLM tools to use (comma-separated: codex, claude)
-# Default: "codex,claude"
-tools = "codex,claude"
+# LLM tools to use (comma-separated: gemini, codex, claude)
+# Default: "gemini,codex,claude"
+tools = "gemini,codex,claude"
 
 # Sleep duration between LLM calls in seconds
 # Default: 15
@@ -363,6 +405,20 @@ worker_prompt = "@{checklist} Do the thing."
 # Completion detection token
 # Default: "__ALL_TASKS_COMPLETE__"
 completion_token = "__ALL_TASKS_COMPLETE__"
+
+# Run mode (worker or controller)
+# Default: "worker"
+# mode = "worker"
+
+# Standing Orders audit configuration (see AGENTS_GUIDE.md)
+# skip_audit = true
+# orders_path = "AGENTS.md"
+# commit_audit = true
+
+# Model selection for LLM tools
+# gemini_model = "gemini-2.5-pro"
+# claude_model = "opus"
+# codex_model = "o3"
 ```
 
 ### Configuration Examples
@@ -408,48 +464,168 @@ afkcode run checklist.md  # Uses Claude
 
 ### Supported Tools
 
-afkcode supports these LLM CLI tools with automatic fallback:
+afkcode supports these LLM CLI tools and APIs with automatic fallback:
 
-1. **Codex CLI** (`codex`)
+1. **Gemini CLI** (`gemini`) - **Default first choice**
+   - Command: `gemini --yolo`
+   - Flags automatically added by afkcode for unattended operation
+   - Rate limit detection: "rate limit", "429", "quota"
+   - Model selection: `--gemini-model gemini-2.5-pro`
+
+2. **Codex CLI** (`codex`)
    - Command: `codex exec`
    - Configuration: Requires `~/.codex/config.toml` with `approval_policy = "never"`
    - Rate limit detection: "rate limit reached", "429", "rate_limit_error"
+   - Model selection: `--codex-model o3` or `--codex-model o4-mini`
 
-2. **Claude Code** (`claude`)
+3. **Claude Code** (`claude`)
    - Command: `claude --print --dangerously-skip-permissions`
    - Flags automatically added by afkcode for unattended operation
    - Rate limit detection: "usage limit reached", "limit will reset", "429"
+   - Model selection: `--claude-model opus` or `--claude-model sonnet`
+
+4. **Warp Agent API** (`warp`) - **HTTP-based, multi-model**
+   - Type: REST API (not CLI-based)
+   - API endpoint: `https://app.warp.dev/api/v1`
+   - Authentication: Bearer token via `WARP_API_KEY` environment variable or config
+   - Rate limit detection: "rate limit", "429", "quota exceeded"
+   - **Supports many models** via `warp_model` config:
+     - **Claude**: `claude-sonnet-4-5`, `claude-opus-4-1`, `claude-haiku-4-5`, `claude-sonnet-4`
+     - **OpenAI**: `gpt-5`, `gpt-5-1` (with low/medium/high reasoning modes)
+     - **Google**: `gemini-3-pro`, `gemini-2-5-pro`
+     - **z.ai**: `glm-4-6`
+     - **Auto modes**: `auto-cost-efficient`, `auto-responsiveness`
 
 ### Using Default Fallback
 
 ```bash
-# Tries Codex first, falls back to Claude on rate limit
+# Tries Gemini first, then Codex, then Claude on rate limits
 afkcode run checklist.md
-afkcode run checklist.md --tools codex,claude
+afkcode run checklist.md --tools gemini,codex,claude
 ```
 
 ### Using Single Tool
 
 ```bash
-# Codex only (no fallback)
-afkcode run checklist.md --tools codex
+# Gemini only (no fallback)
+afkcode run checklist.md --tools gemini
 
-# Claude only (no fallback)
-afkcode run checklist.md --tools claude
+# Gemini with specific model
+afkcode run checklist.md --tools gemini --gemini-model gemini-2.5-pro
+
+# Codex only with specific model
+afkcode run checklist.md --tools codex --codex-model o3
+
+# Claude only with specific model
+afkcode run checklist.md --tools claude --claude-model opus
 ```
 
 ### Custom Tool Order
 
 ```bash
-# Try Claude first, fall back to Codex
-afkcode run checklist.md --tools claude,codex
+# Try Claude first, fall back to Codex, then Gemini
+afkcode run checklist.md --tools claude,codex,gemini
+
+# Try Codex only, no Gemini
+afkcode run checklist.md --tools codex
 ```
 
-**Note**: Both tools must be installed and available on your PATH for fallback to work.
+### Model Selection Examples
+
+```bash
+# Use specific models for each tool
+afkcode run checklist.md \
+  --tools gemini,claude \
+  --gemini-model gemini-2.5-pro \
+  --claude-model opus
+
+# Configure via config file
+echo 'gemini_model = "gemini-2.5-pro"' >> afkcode.toml
+echo 'claude_model = "sonnet"' >> afkcode.toml
+afkcode run checklist.md
+```
+
+**Note**: CLI tools (gemini, codex, claude) must be installed and available on your PATH. Warp Agent API only requires an API key.
+
+### Warp Agent API
+
+Warp Agent API is a powerful option that provides access to multiple LLM models through a single HTTP API.
+
+**Key Benefits:**
+- **Multi-model access**: Switch between Claude, GPT, Gemini, and more via configuration
+- **No CLI installation**: Just needs an API key
+- **Unified billing**: One account for all models
+- **Latest models**: Access to Claude 4.5 Sonnet, GPT-5, Gemini 3 Pro, etc.
+- **Auto modes**: Let Warp choose the best model automatically
+
+**Setup:**
+
+1. Get your API key from [Warp](https://app.warp.dev)
+2. Set environment variable:
+   ```bash
+   export WARP_API_KEY="your-key-here"
+   ```
+3. Or add to `afkcode.toml`:
+   ```toml
+   warp_api_key = "your-key-here"
+   warp_model = "claude-sonnet-4-5"  # or any supported model
+   ```
+
+**Usage:**
+```bash
+# Use Warp Agent API
+afkcode run checklist.md --tools warp
+
+# With specific model
+echo 'warp_model = "gpt-5"' >> afkcode.toml
+afkcode run checklist.md --tools warp
+
+# As fallback after Gemini
+afkcode run checklist.md --tools gemini,warp
+```
+
+**Available Models:**
+
+Warp Agent API supports a curated set of top LLMs:
+
+- **Claude (Anthropic)**:
+  - `claude-sonnet-4-5` - Latest Sonnet model
+  - `claude-opus-4-1` - Most capable Claude model
+  - `claude-haiku-4-5` - Fast and efficient
+  - `claude-sonnet-4` - Previous generation
+
+- **GPT (OpenAI)**:
+  - `gpt-5` - Latest GPT model
+  - `gpt-5-1` - GPT-5.1 with configurable reasoning
+
+- **Gemini (Google)**:
+  - `gemini-3-pro` - Latest Gemini
+  - `gemini-2-5-pro` - Previous generation
+
+- **GLM (z.ai)**:
+  - `glm-4-6` - Hosted by Fireworks AI
+
+- **Auto Modes**:
+  - `auto-cost-efficient` - Optimizes for lower credit consumption
+  - `auto-responsiveness` - Prioritizes highest quality and speed
+
+See [Warp's model documentation](https://docs.warp.dev/agents/using-agents/model-choice) for the latest model list.
 
 ### Unattended Configuration
 
-For autonomous operation, afkcode requires both LLM tools to be configured for unattended/automatic execution without prompts.
+For autonomous operation, afkcode requires all LLM tools to be configured for unattended/automatic execution without prompts.
+
+#### Gemini CLI Configuration
+
+Gemini CLI is configured with the `--yolo` flag for unattended operation. afkcode automatically passes this flag:
+
+```bash
+gemini --yolo
+```
+
+- `--yolo`: Enables fully unattended execution without approval prompts
+
+**Note**: Ensure Gemini CLI is installed and authenticated. No additional configuration file is needed.
 
 #### Codex CLI Configuration
 
@@ -497,6 +673,7 @@ claude --print --dangerously-skip-permissions
 **Problem**: Tool not found error
 ```bash
 # Make sure your LLM tools are installed and on PATH
+which gemini
 which codex
 which claude
 
@@ -534,12 +711,33 @@ afkcode generate project.md "..." --tools claude
 
 **Problem**: Fallback not working
 ```bash
-# Verify both tools are installed
-which codex && which claude
+# Verify tools are installed
+which gemini && which codex && which claude
 
 # Check rate limit detection messages in output
-# Should see "Rate limit detected for codex"
-# Followed by "Switching to fallback tool: claude"
+# Should see "Rate limit detected for gemini"
+# Followed by "Switching to fallback tool: codex"
+```
+
+**Problem**: Standing Orders being modified unexpectedly
+```bash
+# Audit is disabled by default to prevent unwanted changes
+# Only run audit when you explicitly want to sync Standing Orders
+afkcode run project.md --run-audit
+
+# To completely disable audit in config:
+echo 'skip_audit = true' >> afkcode.toml
+```
+
+**Problem**: Want to use custom AGENTS.md location
+```bash
+# Specify custom path via CLI
+afkcode run project.md --run-audit --audit-orders-path docs/AGENTS.md
+
+# Or via config file
+echo 'orders_path = "docs/AGENTS.md"' >> afkcode.toml
+
+# See AGENTS_GUIDE.md for complete documentation
 ```
 
 ## Development
@@ -568,8 +766,15 @@ cargo run -- --help
 
 ### New Features (Latest)
 
-- **Temporary Tool Squelching**: Rate-limited tools are now temporarily disabled for 5 minutes instead of permanently. After the timeout, the system automatically attempts to use the most preferred tool again.
-- **Completion Token Verification**: When the completion token is detected, an LLM verification step confirms the token was intentionally emitted before exiting the loop. This prevents false positives from accidental mentions in LLM reasoning traces.
+- **Warp Agent API Support**: HTTP-based access to multiple LLM models (Claude 4.5, GPT-5, Gemini 3 Pro, etc.) through Warp's unified API
+- **Multi-Model Selection via Warp**: Single API key provides access to Claude, OpenAI, Google, and z.ai models
+- **Gemini Support**: Gemini CLI is now the default first tool in the fallback chain
+- **Model Selection**: Specify custom models for each LLM tool (--gemini-model, --claude-model, --codex-model, warp_model)
+- **Custom AGENTS.md**: Comprehensive support for separate Standing Orders files (see AGENTS_GUIDE.md)
+- **Audit Disabled by Default**: Standing Orders audit now requires --run-audit flag to prevent unwanted changes
+- **Enhanced Configuration**: Added skip_audit, orders_path, commit_audit, warp_api_key, warp_model, and model selection config options
+- **Temporary Tool Squelching**: Rate-limited tools are temporarily disabled for 5 minutes, then automatically retry
+- **Completion Token Verification**: LLM confirms intentional completion to prevent false positives
 
 ### Bug Fixes
 
@@ -586,13 +791,15 @@ cargo run -- --help
 ## Differences from Python Version
 
 1. **Subcommands**: Not just a loop - full checklist management toolkit
-2. **Standing Orders**: Built-in invariants from webdev2.md
+2. **Standing Orders**: Built-in invariants with audit support and custom AGENTS.md
 3. **Automatic Fallback**: Seamless switching between LLM tools on rate limits
-4. **Supported Tools**: Codex CLI and Claude Code with tool-specific rate limit detection
-5. **Better Error Handling**: Comprehensive error messages with anyhow
-6. **Type Safety**: Compile-time guarantees for correctness
-7. **Cross-Platform**: Works on Linux, macOS, Windows
-8. **Configuration Files**: TOML-based configuration for project-specific settings
+4. **Supported Tools**: Gemini, Codex CLI, Claude Code, and Warp Agent API with tool-specific rate limit detection
+5. **Warp Agent API**: HTTP-based multi-model access (Claude 4.5, GPT-5, Gemini 3 Pro, GLM 4.6, Auto modes)
+6. **Model Selection**: Specify custom models per tool (e.g., gemini-2.5-pro, o3, opus, claude-sonnet-4-5)
+6. **Better Error Handling**: Comprehensive error messages with anyhow
+7. **Type Safety**: Compile-time guarantees for correctness
+8. **Cross-Platform**: Works on Linux, macOS, Windows
+9. **Configuration Files**: TOML-based configuration for project-specific settings
 
 ## Contributing
 
@@ -607,6 +814,9 @@ Copyright (c) 2025 Sean McNamara <smcnam@gmail.com>
 
 ## See Also
 
-- `AGENTS.md` - LLM-focused documentation (not for human reading)
+- [`AGENTS_GUIDE.md`](AGENTS_GUIDE.md) - Complete guide to Custom AGENTS.md and Standing Orders audit
+- `AGENTS.md` - Template for LLM-focused project documentation (created via `--run-audit`)
 - `example_checklist.md` - Sample checklist structure
+- `afkcode.toml.example` - Complete configuration file example
+- `TESTING.md` - Testing documentation and smoke test suite
 - GitHub: https://github.com/allquixotic/afkcode

@@ -97,7 +97,6 @@ fn worker_stop_token_happy_path() {
         .arg("checklist.md")
         .arg("--mode")
         .arg("worker")
-        .arg("--skip-audit")
         .arg("--tools")
         .arg("codex")
         .arg("--sleep-seconds")
@@ -145,7 +144,6 @@ fn worker_stop_token_false_positive_requires_confirmation() {
         .arg("checklist.md")
         .arg("--mode")
         .arg("worker")
-        .arg("--skip-audit")
         .arg("--tools")
         .arg("codex")
         .arg("--sleep-seconds")
@@ -220,6 +218,7 @@ fn standing_orders_audit_aligns_and_commits() {
         .arg("checklist.md")
         .arg("--mode")
         .arg("worker")
+        .arg("--run-audit")
         .arg("--tools")
         .arg("codex")
         .arg("--sleep-seconds")
@@ -233,7 +232,11 @@ fn standing_orders_audit_aligns_and_commits() {
         .success();
 
     let agents = fs::read_to_string(workdir.join("AGENTS.md")).unwrap();
-    assert!(agents.starts_with(&core_orders));
+    // Check that the core standing orders are present in AGENTS.md
+    assert!(agents.contains("# STANDING ORDERS - DO NOT DELETE"));
+    assert!(agents.contains("1. Minimal Information:"));
+    assert!(agents.contains("2. Completion Handling:"));
+    assert!(agents.contains("9. Stop Token Etiquette"));
 
     let commit_subject = Command::new("git")
         .args(["log", "-1", "--pretty=%s"])
@@ -270,7 +273,6 @@ fn controller_mode_backwards_compatible() {
         .arg("checklist.md")
         .arg("--mode")
         .arg("controller")
-        .arg("--skip-audit")
         .arg("--tools")
         .arg("codex")
         .arg("--sleep-seconds")

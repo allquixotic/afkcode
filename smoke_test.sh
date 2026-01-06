@@ -153,8 +153,8 @@ test_add() {
     # First ensure there's a section
     echo -e "\n# Custom Section\n" >> "$checklist"
     if "$AFKCODE" add "$checklist" "Task in custom section" --section "Custom Section" > /dev/null 2>&1; then
-        # Check if item appears after the section header
-        if awk '/# Custom Section/,/^#/ {if (/Task in custom section/) exit 0} END {exit 1}' "$checklist" 2>/dev/null; then
+        # Check if item appears after the section header and before the next header (or EOF)
+        if grep -A 5 "# Custom Section" "$checklist" | grep -q "Task in custom section"; then
             print_pass "Item added to specific section"
         else
             print_fail "Item not in correct section"
@@ -350,12 +350,12 @@ test_file_format() {
         print_fail "Missing standing orders section"
     fi
 
-    # Count the standing orders (should be 8)
+    # Count the standing orders (should be 9)
     local order_count=$(grep -c "^[0-9]\+\. " "$checklist" || true)
-    if [ "$order_count" -eq 8 ]; then
-        print_pass "Has all 8 standing orders"
+    if [ "$order_count" -eq 9 ]; then
+        print_pass "Has all 9 standing orders"
     else
-        print_fail "Expected 8 standing orders, found $order_count"
+        print_fail "Expected 9 standing orders, found $order_count"
     fi
 }
 

@@ -2,10 +2,11 @@
 # Copy this file to afkcode.toml in your project directory and customize as needed
 # Configuration precedence: CLI args > config file > built-in defaults
 
-# LLM tools to use (comma-separated: codex, claude)
-# Default: "codex,claude"
+# LLM tools to use (comma-separated: gemini, codex, claude, warp)
+# Default: "gemini,codex,claude"
 # Try tools in order, falling back on rate limits
-tools = "codex,claude"
+# Warp Agent API provides access to many models via HTTP
+tools = "gemini,codex,claude"
 
 # Sleep duration between LLM calls in seconds
 # Default: 15
@@ -17,6 +18,49 @@ sleep_seconds = 15
 # All console output will be mirrored to this file
 # Uncomment and customize if needed:
 # log_file = "afkcode.log"
+
+# Run mode (worker or controller)
+# Default: "worker"
+# Use "controller" for legacy controller/worker alternation
+# mode = "worker"
+
+# Standing Orders audit configuration
+# Skip audit by default (recommended to avoid unwanted changes)
+# Default: true
+# Set to false to run audit automatically on every run
+# skip_audit = true
+
+# Custom path for Standing Orders file (AGENTS.md)
+# If not specified, uses AGENTS.md in current directory (if exists)
+# or the Standing Orders section within the checklist
+# See AGENTS_GUIDE.md for detailed documentation
+# orders_path = "AGENTS.md"
+# orders_path = "docs/AGENTS.md"
+
+# Automatically commit audit changes to git
+# Default: true
+# Set to false to manually review and commit audit changes
+# commit_audit = true
+
+# Model selection for each LLM tool
+# These allow you to specify custom models instead of defaults
+# gemini_model = "gemini-2.5-pro"
+# claude_model = "opus"  # or "sonnet", "claude-sonnet-4-5-20250929"
+# codex_model = "o3"     # or "o4-mini"
+
+# Warp Agent API configuration
+# API key for Warp Agent (or set WARP_API_KEY environment variable)
+# Get your API key from https://app.warp.dev
+# warp_api_key = "your-warp-api-key-here"
+
+# Model to use for Warp Agent API
+# Warp supports many models including:
+# - Claude: "claude-sonnet-4-5", "claude-opus-4-1", "claude-haiku-4-5", "claude-sonnet-4"
+# - OpenAI: "gpt-5", "gpt-5-1" (with reasoning levels)
+# - Google: "gemini-3-pro", "gemini-2-5-pro"
+# - z.ai: "glm-4-6"
+# - Auto modes: "auto-cost-efficient", "auto-responsiveness"
+# warp_model = "claude-sonnet-4-5"
 
 # Controller prompt template
 # Default: built-in template
