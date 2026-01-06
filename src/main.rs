@@ -186,6 +186,19 @@ fn main() -> Result<()> {
             let merged_items_per_instance =
                 config.merge_with_cli(items_per_instance, config.gimme_items_per_instance, 1usize);
 
+            // Reset any orphaned in-progress markers from previous interrupted runs
+            if merged_gimme_enabled {
+                match gimme::marker::reset_orphaned_markers(&merged_gimme_base_path) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        eprintln!("Reset {} orphaned in-progress item(s)", count);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to reset orphaned markers: {}", e);
+                    }
+                }
+            }
+
             cmd_run(
                 checklist,
                 merged_controller_prompt,

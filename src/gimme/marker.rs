@@ -23,7 +23,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use super::{generate_checkout_id, ChecklistItem};
+use super::{extract_checkout_id, generate_checkout_id, ChecklistItem, MarkerType};
+use crate::gimme::parser;
 
 /// Pattern to match and replace checklist markers.
 static MARKER_PATTERN: Lazy<Regex> = Lazy::new(|| {
@@ -134,6 +135,65 @@ pub fn restore_item(item: &ChecklistItem) -> Result<bool> {
     atomic_write(&item.file, &new_content)?;
 
     Ok(true)
+}
+
+/// Reset all orphaned in-progress markers to incomplete `[ ]`.
+///
+/// Scans all AGENTS.md files under the given base path and resets any
+/// `[ip]` or `[ip:XXXX]` markers to `[ ]`. This should be called at startup
+/// to clean up markers from previous interrupted runs.
+///
+/// Returns the number of items that were reset.
+pub fn reset_orphaned_markers(base_path: &Path) -> Result<usize> {
+    let files = parser::find_agents_files(base_path)?;
+    let mut reset_count = 0;
+
+    for file_path in files {
+        let items = parser::parse_file(&file_path)?;
+
+        // Find in-progress items in this file
+        let orphaned: Vec<_> = items
+            .iter()
+            .filter(|item| MarkerType::from_marker(&item.marker) == MarkerType::InProgress)
+            .collect();
+
+        if orphaned.is_empty() {
+            continue;
+        }
+
+        // Read the file content
+        let content = fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read {}", file_path.display()))?;
+
+        // Replace all [ip...] markers with [ ]
+        let mut new_content = content.clone();
+        for item in &orphaned {
+            let checkout_id = extract_checkout_id(&item.marker);
+            let id_str = checkout_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown");
+
+            eprintln!(
+                "Resetting orphaned item {}: {} ({}:{})",
+                id_str,
+                item.content,
+                file_path.display(),
+                item.line
+            );
+
+            // Replace the specific marker pattern
+            new_content = new_content.replace(&item.marker, "[ ]");
+            reset_count += 1;
+        }
+
+        // Only write if we made changes
+        if new_content != content {
+            atomic_write(&file_path, &new_content)?;
+        }
+    }
+
+    Ok(reset_count)
 }
 
 /// Validate that items still exist at their expected positions.
@@ -343,5 +403,56 @@ mod tests {
         }];
 
         assert!(validate_items(&items).is_err());
+    }
+
+    #[test]
+    fn test_reset_orphaned_markers() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"# Tasks
+
+- [ip:a3f7] Orphaned task one
+- [ ] Normal task
+- [ip:1234] Orphaned task two
+- [x] Completed task
+"#;
+        create_test_file(dir.path(), "AGENTS.md", content);
+
+        let count = reset_orphaned_markers(dir.path()).unwrap();
+        assert_eq!(count, 2);
+
+        // Verify the file was updated
+        let new_content = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(new_content.contains("- [ ] Orphaned task one"));
+        assert!(new_content.contains("- [ ] Normal task"));
+        assert!(new_content.contains("- [ ] Orphaned task two"));
+        assert!(new_content.contains("- [x] Completed task"));
+        assert!(!new_content.contains("[ip:"));
+    }
+
+    #[test]
+    fn test_reset_orphaned_markers_plain_ip() {
+        let dir = TempDir::new().unwrap();
+        let content = "- [ip] Plain in-progress task\n";
+        create_test_file(dir.path(), "AGENTS.md", content);
+
+        let count = reset_orphaned_markers(dir.path()).unwrap();
+        assert_eq!(count, 1);
+
+        let new_content = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(new_content.contains("- [ ] Plain in-progress task"));
+    }
+
+    #[test]
+    fn test_reset_orphaned_markers_no_orphans() {
+        let dir = TempDir::new().unwrap();
+        let content = "- [ ] Normal task\n- [x] Completed task\n";
+        create_test_file(dir.path(), "AGENTS.md", content);
+
+        let count = reset_orphaned_markers(dir.path()).unwrap();
+        assert_eq!(count, 0);
+
+        // File should be unchanged
+        let new_content = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert_eq!(new_content, content);
     }
 }
